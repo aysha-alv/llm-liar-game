@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+data/results/
+data/traces/
+data/self_play/
+data/cfr/
+*.jsonl
+.DS_Store
