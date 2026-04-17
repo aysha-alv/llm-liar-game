@@ -1,4 +1,5 @@
-from .base_agent import BaseAgent
+from .base import BaseAgent
+from .scripted import HonestAgent, BluffAgent, HeuristicAgent
 from .archetypes import (
     TheSaint,
     ComebackCloser,
@@ -6,21 +7,22 @@ from .archetypes import (
     MrPathological,
     TheAccountant,
     TheCollector,
-    RandomAgent,
 )
-from .llm_agent import GrokAgent, LLMAgent, MODEL_CONFIGS, parse_model_spec
+from .llm_agent import LLMAgent, MODEL_CONFIGS, PROMPT_MODES, parse_model_spec
 
 __all__ = [
     "BaseAgent",
+    "HonestAgent",
+    "BluffAgent",
+    "HeuristicAgent",
     "TheSaint",
     "ComebackCloser",
     "GameTheorist",
     "MrPathological",
     "TheAccountant",
     "TheCollector",
-    "RandomAgent",
-    "GrokAgent",
     "LLMAgent",
     "MODEL_CONFIGS",
+    "PROMPT_MODES",
     "parse_model_spec",
 ]

@@ -1,16 +1,16 @@
 """
-Phase 1 — Baseline Testing
+Phase 1 — Baseline Tournament
 
-Runs a tournament: LLM (multi-provider) vs rule-based archetypes.
-Reports win rate, bluff/challenge stats, challenge rate, card pickup breakdown,
-LLM fallback-play count, failure modes, and traces.
+4-player games: 1 LLM seat + 3 randomly sampled archetypes.
+After each play, all other players are polled for a challenge in clockwise order
+(first challenger wins, rest skip — standard Liar rules).
 
 Usage:
     python scripts/phase1_baseline.py --games 50 --players 4
     python scripts/phase1_baseline.py --provider xai --model grok-3
-    python scripts/phase1_baseline.py --models grok-3,openai:gpt-4o-mini
+    python scripts/phase1_baseline.py --prompt-mode few_shot --games 100
+    python scripts/phase1_baseline.py --models grok-3,gpt-4o
 """
-
 from __future__ import annotations
 
 import argparse
@@ -23,85 +23,173 @@ from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
-# Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from game.game_state import GameState
-from game.liar_game import LiarGame
+from engine.card import full_deck, deal
+from engine.state import GameState
+from engine.game import apply_action, _copy_state
+from logging_.logger import EpisodeLogger
 from agents import (
-    LLMAgent,
-    MODEL_CONFIGS,
-    TheSaint,
-    ComebackCloser,
-    GameTheorist,
-    MrPathological,
-    TheAccountant,
-    TheCollector,
-    parse_model_spec,
+    LLMAgent, MODEL_CONFIGS, PROMPT_MODES, parse_model_spec,
+    TheSaint, ComebackCloser, GameTheorist,
+    MrPathological, TheAccountant, TheCollector,
 )
+from evaluation.metrics import InformationTheoreticMetrics
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+MAX_TURNS = 600
 
-def _default_agent_stats():
-    return {
-        "wins": 0,
-        "games": 0,
-        "bluffs": 0,
-        "bluffs_caught": 0,
-        "challenges": 0,
-        "challenges_won": 0,
-        "challenge_opportunities": 0,
-        "cards_picked_up_bluff_caught": 0,
-        "cards_picked_up_lost_challenge": 0,
-        "fallback_plays": 0,
-    }
+ARCHETYPES = [
+    ("TheSaint",       TheSaint),
+    ("ComebackCloser", ComebackCloser),
+    ("GameTheorist",   GameTheorist),
+    ("MrPathological", MrPathological),
+    ("TheAccountant",  TheAccountant),
+    ("TheCollector",   TheCollector),
+]
 
 
 # ---------------------------------------------------------------------------
-# Failure mode detection
+# N-player episode runner
 # ---------------------------------------------------------------------------
 
-
-def detect_failure_modes(state: GameState, llm_id: int) -> dict:
+def run_episode(agents, seed: int, verbose: bool = False) -> EpisodeLogger:
     """
-    Analyze a completed game for documented LLM failure modes.
+    Run one game with N agents.
+
+    After each play, poll all OTHER players in clockwise order for a challenge.
+    First player to challenge wins; rest skip.
     """
-    failures = {
-        "indexing_errors": 0,
-        "computation_errors": 0,
-        "control_flow_errors": 0,
-        "hallucination": 0,
-        "logic_following": 0,
-    }
+    n = len(agents)
+    rng = random.Random(seed)
+    deck = full_deck()
+    rng.shuffle(deck)
+    hands = deal(deck, n)
+    state = GameState.new(hands)
 
-    llm_claims = [r for r in state.claim_history if r.player_id == llm_id]
+    for agent in agents:
+        agent.reset()
 
-    for claim in llm_claims:
-        if claim.claimed_count > 4:
-            failures["computation_errors"] += 1
+    ep_logger = EpisodeLogger(seed=seed)
+    ep_logger.agents = [
+        {"player_id": a.player_id, "name": a.name, "type": type(a).__name__}
+        for a in agents
+    ]
 
-        if claim.was_challenged and claim.challenge_result == "liar_caught":
-            if claim.claimed_count > len(claim.actual_cards) + 2:
-                failures["hallucination"] += 1
+    def _public_event_for(event: dict, for_player: int) -> dict:
+        """Filter event so observers can't see actual_cards from a play."""
+        if event.get("action", {}).get("type") == "challenge":
+            return event  # challenge reveal is public
+        actor = event["player"]
+        if for_player == actor:
+            return event
+        return {
+            "turn":         event["turn"],
+            "player":       actor,
+            "action":       {"type": "play"},
+            "claimed_rank": event.get("claimed_rank"),
+            "n_cards":      event.get("n_cards"),
+        }
 
-    return failures
+    while not state.is_terminal and state.turn < MAX_TURNS:
+        player = state.current_player
+        agent  = agents[player]
+        obs    = state.public_observation(player)
+
+        # Current player PLAYS (no challenge option on your own turn)
+        action = agent.choose_action(obs)
+        # Ensure they play, not challenge (it's their turn to play)
+        if action.get("type") == "challenge":
+            logger.debug("Agent %s tried to challenge on their play turn — overriding", agent.name)
+            action = {"type": "play", "cards": [obs["my_hand"][0]], "claimed_rank": obs["current_rank"]}
+
+        new_state, play_event = apply_action(state, action)
+        belief = agent.report_belief(obs)
+
+        # Broadcast play event to all agents
+        for pid, ag in enumerate(agents):
+            ag.observe_event(_public_event_for(play_event, pid))
+
+        ep_logger.log_turn(
+            turn=state.turn, player=player, action=action,
+            observation_before=obs, event=play_event,
+            hand_sizes_after=new_state.hand_sizes(),
+            beliefs={str(player): belief} if belief else None,
+        )
+
+        if verbose:
+            _print_turn(play_event, new_state)
+
+        state = new_state
+        if state.is_terminal:
+            break
+
+        # --- CHALLENGE PHASE: poll other players in clockwise order ---
+        challenged = False
+        for i in range(1, n):
+            challenger_id = (player + i) % n
+            challenger    = agents[challenger_id]
+            c_obs = state.public_observation(challenger_id)
+
+            c_action = challenger.choose_action(c_obs)
+
+            if c_action.get("type") == "challenge":
+                # Apply the challenge: temporarily set current_player to challenger
+                challenge_state = _copy_state(state)
+                challenge_state.current_player = challenger_id
+                new_state2, ch_event = apply_action(challenge_state, {"type": "challenge"})
+                ch_belief = challenger.report_belief(c_obs)
+
+                for pid, ag in enumerate(agents):
+                    ag.observe_event(_public_event_for(ch_event, pid))
+
+                ep_logger.log_turn(
+                    turn=state.turn, player=challenger_id,
+                    action={"type": "challenge"},
+                    observation_before=c_obs, event=ch_event,
+                    hand_sizes_after=new_state2.hand_sizes(),
+                    beliefs={str(challenger_id): ch_belief} if ch_belief else None,
+                )
+
+                if verbose:
+                    _print_turn(ch_event, new_state2)
+
+                state = new_state2
+                challenged = True
+                break
+            # else: pass (they chose to play — we ignore the play action here,
+            # it'll be their turn when the normal loop reaches them)
+
+        if state.is_terminal:
+            break
+
+    winner = state.winner if state.is_terminal else min(range(n), key=lambda i: len(state.hands[i]))
+    reason = "empty_hand" if state.is_terminal else "max_turns_reached"
+    ep_logger.log_outcome(winner=winner, total_turns=state.turn, reason=reason)
+
+    return ep_logger
+
+
+def _print_turn(event: dict, state: GameState) -> None:
+    t = event["turn"]
+    p = event["player"]
+    atype = event.get("action", {}).get("type")
+    if atype == "play":
+        flag = "(honest)" if event.get("honest") else "(BLUFF)"
+        print(f"[T{t:03d}] P{p} plays {event['n_cards']}x {event['claimed_rank']} "
+              f"{flag}  hands={state.hand_sizes()}")
+    elif atype == "challenge":
+        print(f"[T{t:03d}] P{p} CHALLENGES → {event.get('challenge_result')}  "
+              f"pile→P{event.get('pile_goes_to')}  hands={state.hand_sizes()}")
+    if "winner" in event:
+        print(f"  *** P{event['winner']} wins! ***")
 
 
 # ---------------------------------------------------------------------------
 # Tournament runner
 # ---------------------------------------------------------------------------
-
-ARCHETYPES = [
-    ("TheSaint", TheSaint),
-    ("ComebackCloser", ComebackCloser),
-    ("GameTheorist", GameTheorist),
-    ("MrPathological", MrPathological),
-    ("TheAccountant", TheAccountant),
-    ("TheCollector", TheCollector),
-]
-
 
 def run_tournament(
     num_games: int = 50,
@@ -114,237 +202,204 @@ def run_tournament(
     llm_results_key: str = "LLM",
     base_url: str | None = None,
     api_key: str | None = None,
+    prompt_mode: str = "cot",
 ) -> dict:
-    """
-    Run num_games with one LLM seat + (num_players-1) archetypes.
-    """
     if output_dir is None:
         output_dir = Path(__file__).parent.parent / "data" / "results"
     output_dir.mkdir(parents=True, exist_ok=True)
-
     traces_dir = Path(__file__).parent.parent / "data" / "traces"
     traces_dir.mkdir(parents=True, exist_ok=True)
 
-    results: dict = defaultdict(_default_agent_stats)
-    failure_totals: dict = defaultdict(int)
+    it_metrics = InformationTheoreticMetrics()
+    agent_stats: dict = defaultdict(lambda: defaultdict(int))
     all_game_summaries = []
 
-    logger.info(
-        "Starting Phase 1: %s games, %s players, LLM=%s/%s (%s)",
-        num_games,
-        num_players,
-        llm_provider,
-        llm_model,
-        llm_results_key,
-    )
+    logger.info("Phase 1: %s games, %s players, model=%s/%s, prompt_mode=%s",
+                num_games, num_players, llm_provider, llm_model, prompt_mode)
 
     try:
         llm = LLMAgent(
+            player_id=0,  # reassigned each game below
             name=llm_results_key,
             provider=llm_provider,
             model=llm_model,
             base_url=base_url,
             api_key=api_key,
+            prompt_mode=prompt_mode,
         )
     except ValueError as e:
         logger.error("Could not initialize LLMAgent: %s", e)
         sys.exit(1)
 
     for game_num in range(num_games):
-        seed = random.randint(0, 999999)
-        llm.fallback_play_count = 0
+        seed = random.randint(0, 999_999)
+        llm.reset()
 
-        opponent_classes = random.sample(ARCHETYPES, min(num_players - 1, len(ARCHETYPES)))
-        opponents = [cls(name=f"{name}_{game_num}") for name, cls in opponent_classes]
+        # Sample opponents
+        n_opponents = min(num_players - 1, len(ARCHETYPES))
+        opp_specs = random.sample(ARCHETYPES, n_opponents)
+        opponents = [cls(player_id=i + 1, name=f"{nm}") for i, (nm, cls) in enumerate(opp_specs)]
 
-        grok_pos = random.randint(0, num_players - 1)
-        agents = opponents[:grok_pos] + [llm] + opponents[grok_pos:]
-        agents = agents[:num_players]
+        # Randomise LLM seat
+        llm_seat = random.randint(0, num_players - 1)
+        agents_list = opponents[:]
+        agents_list.insert(llm_seat, llm)
+        agents_list = agents_list[:num_players]
 
-        llm_id = agents.index(llm)
+        # Re-assign player IDs by position
+        for idx, ag in enumerate(agents_list):
+            ag.player_id = idx
 
-        game = LiarGame(agents=agents, seed=seed, verbose=verbose)
-        winner_id, final_state = game.play()
+        llm_id = llm_seat
 
-        for agent in agents:
-            pid = agents.index(agent)
-            player = final_state.players[pid]
-            aname = agent.name.split("_")[0]
-            results[aname]["games"] += 1
-            results[aname]["bluffs"] += player.bluffs_attempted
-            results[aname]["bluffs_caught"] += player.bluffs_caught
-            results[aname]["challenges"] += player.challenges_issued
-            results[aname]["challenges_won"] += player.challenges_won
-            results[aname]["cards_picked_up_bluff_caught"] += player.cards_picked_up_bluff_caught
-            results[aname]["cards_picked_up_lost_challenge"] += player.cards_picked_up_lost_challenge
-            opp = sum(1 for r in final_state.claim_history if r.player_id != pid)
-            results[aname]["challenge_opportunities"] += opp
-            if agent is llm:
-                results[aname]["fallback_plays"] += llm.fallback_play_count
+        ep = run_episode(agents_list, seed=seed, verbose=verbose)
+        log = ep.to_dict()
+        winner_id = log["outcome"]["winner"]
 
-        if winner_id == llm_id:
-            results[llm_results_key]["wins"] += 1
-        else:
-            winner_agent = agents[winner_id]
-            wname = winner_agent.name.split("_")[0]
-            results[wname]["wins"] += 1
+        # Aggregate stats
+        for ag in agents_list:
+            aname = ag.name.split("_")[0]
+            agent_stats[aname]["games"] += 1
+        winner_name = agents_list[winner_id].name.split("_")[0]
+        agent_stats[winner_name]["wins"] += 1
 
-        failures = detect_failure_modes(final_state, llm_id)
-        for k, v in failures.items():
-            failure_totals[k] += v
+        # Per-game IT metrics for LLM
+        it = it_metrics.analyze_episode(log, llm_id)
 
-        llm_player = final_state.players[llm_id]
-        ch_issued = llm_player.challenges_issued
-        ch_won = llm_player.challenges_won
-        ch_opp = sum(1 for r in final_state.claim_history if r.player_id != llm_id)
+        # Count LLM bluffs / challenges from log
+        llm_bluffs = sum(
+            1 for t in log["turns"]
+            if t["player"] == llm_id
+            and t["action"]["type"] == "play"
+            and not t["event"].get("honest", True)
+        )
+        llm_bluffs_caught = sum(
+            1 for t in log["turns"]
+            if t["action"]["type"] == "challenge"
+            and t["event"].get("challenge_result") == "caught_bluffing"
+            and t["event"].get("pile_goes_to") == llm_id
+        )
+        llm_challenges = sum(
+            1 for t in log["turns"]
+            if t["player"] == llm_id and t["action"]["type"] == "challenge"
+        )
+        llm_challenges_won = sum(
+            1 for t in log["turns"]
+            if t["player"] == llm_id
+            and t["action"]["type"] == "challenge"
+            and t["event"].get("challenge_result") == "caught_bluffing"
+        )
 
         game_summary = {
-            "game_num": game_num,
-            "seed": seed,
-            "num_players": num_players,
-            "llm_results_key": llm_results_key,
-            "winner": agents[winner_id].name.split("_")[0],
-            "llm_won": winner_id == llm_id,
-            "turns": final_state.turn_number,
-            "llm_hand_size": llm_player.hand_size,
-            "llm_bluffs_attempted": llm_player.bluffs_attempted,
-            "llm_bluffs_caught": llm_player.bluffs_caught,
-            "llm_challenges_issued": ch_issued,
-            "llm_challenges_won": ch_won,
-            "llm_challenges_lost": ch_issued - ch_won,
-            "llm_challenge_opportunities": ch_opp,
-            "llm_cards_picked_up_bluff_caught": llm_player.cards_picked_up_bluff_caught,
-            "llm_cards_picked_up_lost_challenge": llm_player.cards_picked_up_lost_challenge,
-            "llm_fallback_plays": llm.fallback_play_count,
-            "failure_modes": failures,
-            "opponents": [a.name.split("_")[0] for a in agents if a is not llm],
+            "game_num":                     game_num,
+            "seed":                         seed,
+            "num_players":                  num_players,
+            "llm_results_key":              llm_results_key,
+            "prompt_mode":                  prompt_mode,
+            "winner":                       winner_name,
+            "llm_won":                      winner_id == llm_id,
+            "turns":                        log["outcome"]["total_turns"],
+            "llm_bluffs_attempted":         llm_bluffs,
+            "llm_bluffs_caught":            llm_bluffs_caught,
+            "llm_challenges_issued":        llm_challenges,
+            "llm_challenges_won":           llm_challenges_won,
+            "llm_fallback_plays":           llm.fallback_play_count,
+            "opponents":                    [a.name for a in agents_list if a is not llm],
+            "mutual_information":           it["mutual_information"],
+            "kl_divergence":                it["kl_divergence"],
+            "belief_misalignment":          it["belief_misalignment"],
         }
         all_game_summaries.append(game_summary)
 
         if (game_num + 1) % 10 == 0 or num_games <= 10:
-            wr = results[llm_results_key]["wins"] / max(results[llm_results_key]["games"], 1) * 100
+            wins = sum(1 for s in all_game_summaries if s["llm_won"])
+            wr = wins / (game_num + 1) * 100
             logger.info("Game %s/%s | %s win rate: %.1f%%", game_num + 1, num_games, llm_results_key, wr)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_slug = llm_results_key.replace("/", "-").replace(" ", "_")
 
+    # Save traces
     if save_traces and llm.reasoning_traces:
         trace_file = traces_dir / f"llm_traces_{safe_slug}_{ts}.json"
-        with open(trace_file, "w", encoding="utf-8") as f:
+        with open(trace_file, "w") as f:
             json.dump(llm.reasoning_traces, f, indent=2)
-        logger.info("Saved %s reasoning traces → %s", len(llm.reasoning_traces), trace_file)
+        logger.info("Saved %s traces → %s", len(llm.reasoning_traces), trace_file)
 
-    results_file = output_dir / f"phase1_results_{safe_slug}_{ts}.json"
     final_results = {
         "config": {
-            "num_games": num_games,
-            "num_players": num_players,
-            "llm_provider": llm_provider,
-            "llm_model": llm_model,
+            "num_games":       num_games,
+            "num_players":     num_players,
+            "llm_provider":    llm_provider,
+            "llm_model":       llm_model,
             "llm_results_key": llm_results_key,
+            "prompt_mode":     prompt_mode,
         },
-        "agent_results": dict(results),
-        "failure_modes": dict(failure_totals),
+        "agent_stats":    {k: dict(v) for k, v in agent_stats.items()},
         "game_summaries": all_game_summaries,
     }
-    with open(results_file, "w", encoding="utf-8") as f:
+
+    results_file = output_dir / f"phase1_results_{safe_slug}_{ts}.json"
+    with open(results_file, "w") as f:
         json.dump(final_results, f, indent=2)
 
-    _print_summary(results, failure_totals, num_games, llm_results_key)
-
+    _print_summary(all_game_summaries, llm_results_key, num_games)
     return final_results
 
 
-def _print_summary(results, failure_totals, num_games, llm_results_key: str):
-    print("\n" + "=" * 72)
-    print("PHASE 1 BASELINE RESULTS")
-    print("=" * 72)
-    print(
-        f"\n{'Agent':<22} {'Win%':>7} {'BluffAcc':>9} {'ChalAcc':>8} "
-        f"{'ChalRate':>9} {'FallPlays':>10}"
-    )
-    print("-" * 72)
+def _print_summary(summaries: list, llm_key: str, num_games: int) -> None:
+    wins    = sum(1 for s in summaries if s["llm_won"])
+    bluffs  = sum(s["llm_bluffs_attempted"] for s in summaries)
+    caught  = sum(s["llm_bluffs_caught"] for s in summaries)
+    chals   = sum(s["llm_challenges_issued"] for s in summaries)
+    chal_w  = sum(s["llm_challenges_won"] for s in summaries)
+    mis     = [s["mutual_information"] for s in summaries]
+    kls     = [s["kl_divergence"] for s in summaries]
 
-    for agent_name, r in sorted(results.items(), key=lambda x: -x[1]["wins"]):
-        g = r["games"]
-        if g == 0:
-            continue
-        wr = r["wins"] / g * 100
-        bluff_acc = (r["bluffs"] - r["bluffs_caught"]) / max(r["bluffs"], 1) * 100
-        chal_acc = r["challenges_won"] / max(r["challenges"], 1) * 100
-        chal_rate = r["challenges"] / max(r["challenge_opportunities"], 1) * 100
-        fall = r.get("fallback_plays", 0)
-        marker = f" ◄ {llm_results_key}" if agent_name == llm_results_key else ""
-        print(
-            f"{agent_name:<22} {wr:>6.1f}% {bluff_acc:>8.1f}% {chal_acc:>7.1f}% "
-            f"{chal_rate:>8.1f}% {fall:>10}{marker}"
-        )
-
-    print(f"\n--- {llm_results_key} failure modes ---")
-    for mode, count in failure_totals.items():
-        per_game = count / max(num_games, 1)
-        print(f"  {mode:<30}: {count:>4} total  ({per_game:.2f}/game)")
-    print("=" * 72)
+    print(f"\n{'='*65}")
+    print(f"PHASE 1 RESULTS — {llm_key}")
+    print(f"{'='*65}")
+    print(f"  Games:            {num_games}")
+    print(f"  Win rate:         {wins}/{num_games} ({wins/num_games*100:.1f}%)")
+    print(f"  Bluff catch rate: {caught}/{bluffs} ({caught/max(bluffs,1)*100:.1f}%)")
+    print(f"  Challenge acc:    {chal_w}/{chals} ({chal_w/max(chals,1)*100:.1f}%)")
+    print(f"  Avg MI:           {sum(mis)/max(len(mis),1):.3f}")
+    print(f"  Avg KL:           {sum(kls)/max(len(kls),1):.3f}")
+    print(f"{'='*65}\n")
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-
 def main():
     parser = argparse.ArgumentParser(description="Phase 1: Baseline tournament")
-    parser.add_argument("--games", type=int, default=20, help="Number of games to run")
-    parser.add_argument("--players", type=int, default=4, help="Players per game (3-7)")
-    parser.add_argument("--verbose", action="store_true", help="Log each turn")
-    parser.add_argument("--no-save", action="store_true", help="Don't save traces")
-    parser.add_argument(
-        "--provider",
-        type=str,
-        default="xai",
-        help="Default provider if model spec has no prefix (openai, xai, anthropic, google, local)",
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="grok-3",
-        help="Single model id or preset name (see MODEL_CONFIGS in agents/llm_agent.py)",
-    )
-    parser.add_argument(
-        "--models",
-        type=str,
-        default=None,
-        help="Comma-separated list; each item is a preset key or provider:model",
-    )
-    parser.add_argument(
-        "--llm-name",
-        type=str,
-        default=None,
-        help="Label for results/traces (default: derived from model id)",
-    )
-    parser.add_argument("--base-url", type=str, default=None, help="OpenAI-compatible API base URL (e.g. Ollama)")
-    parser.add_argument("--api-key", type=str, default=None, help="Override API key for the LLM provider")
+    parser.add_argument("--games",    type=int, default=20)
+    parser.add_argument("--players",  type=int, default=4)
+    parser.add_argument("--verbose",  action="store_true")
+    parser.add_argument("--no-save",  action="store_true")
+    parser.add_argument("--provider", type=str, default="xai")
+    parser.add_argument("--model",    type=str, default="grok-3")
+    parser.add_argument("--models",   type=str, default=None,
+                        help="Comma-separated list of model specs")
+    parser.add_argument("--llm-name", type=str, default=None)
+    parser.add_argument("--base-url", type=str, default=None)
+    parser.add_argument("--api-key",  type=str, default=None)
+    parser.add_argument("--prompt-mode", type=str, default="cot",
+                        choices=list(PROMPT_MODES))
     args = parser.parse_args()
 
     env_path = Path(__file__).parent.parent / ".env"
     if env_path.exists():
-        with open(env_path, encoding="utf-8") as f:
+        with open(env_path) as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
                     os.environ.setdefault(k.strip(), v.strip())
 
-    if args.models:
-        specs = [s.strip() for s in args.models.split(",") if s.strip()]
-    else:
-        specs = [args.model.strip()]
-
+    specs = [s.strip() for s in args.models.split(",")] if args.models else [args.model]
     num_players = max(3, min(7, args.players))
-
-    logger.info("MODEL_CONFIGS presets: %s", ", ".join(sorted(MODEL_CONFIGS.keys())))
-    if len(specs) > 1:
-        logger.info("Running %s model configurations sequentially.", len(specs))
 
     for run_idx, spec in enumerate(specs):
         prov, mod = parse_model_spec(spec, args.provider)
@@ -362,6 +417,7 @@ def main():
             llm_results_key=label,
             base_url=args.base_url,
             api_key=args.api_key,
+            prompt_mode=args.prompt_mode,
         )
 
 

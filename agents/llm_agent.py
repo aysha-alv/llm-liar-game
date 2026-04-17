@@ -1,166 +1,145 @@
 """
 Multi-provider LLM agent for Liar (Cheat/Bullshit).
 
-Supports OpenAI-compatible APIs (OpenAI, xAI Grok, Ollama, vLLM), Anthropic, and Google Gemini.
-Returns strict JSON: play | challenge | pass_challenge.
-"""
+Implements the new engine interface: choose_action(obs) -> action dict.
+Supports OpenAI-compatible APIs (OpenAI, xAI/Grok, Ollama), Anthropic, and Google Gemini.
 
+Prompt modes:
+  zero_shot  — rules only, no strategic guidance
+  cot        — rules + strategy + explicit chain-of-thought instruction (default)
+  few_shot   — rules + strategy + worked examples
+"""
 from __future__ import annotations
 import json
 import logging
 import os
 import re
+from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from openai import OpenAI
 
-from .base_agent import BaseAgent
-from game.card import Card, Rank, Suit
+from .base import BaseAgent
+from engine.card import Card, JOKER_RANK, card_from_str
 
 if TYPE_CHECKING:
-    from game.game_state import GameState, ClaimRecord
+    pass
 
 logger = logging.getLogger(__name__)
 
+PROMPT_MODES = {"zero_shot", "cot", "few_shot"}
+
 # ---------------------------------------------------------------------------
-# Preset model IDs → (provider, api_model_id)
+# Model presets
 # ---------------------------------------------------------------------------
 
 MODEL_CONFIGS: Dict[str, Dict[str, str]] = {
-    "grok-3": {"provider": "xai", "model": "grok-3"},
-    "gpt-4o": {"provider": "openai", "model": "gpt-4o"},
-    "gpt-4o-mini": {"provider": "openai", "model": "gpt-4o-mini"},
-    "claude-sonnet-4-20250514": {"provider": "anthropic", "model": "claude-sonnet-4-20250514"},
-    "gemini-2.0-flash": {"provider": "google", "model": "gemini-2.0-flash"},
+    "grok-3":              {"provider": "xai",       "model": "grok-3"},
+    "gpt-4o":              {"provider": "openai",    "model": "gpt-4o"},
+    "gpt-4o-mini":         {"provider": "openai",    "model": "gpt-4o-mini"},
+    "claude-sonnet-4-5":   {"provider": "anthropic", "model": "claude-sonnet-4-5"},
+    "gemini-2.0-flash":    {"provider": "google",    "model": "gemini-2.0-flash"},
 }
 
 # ---------------------------------------------------------------------------
-# Prompt templates
+# Prompt blocks
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are an expert player of the card game Liar (also called Cheat or Bullshit).
+_RULES_BLOCK = """You are a player of the card game Liar (also called Cheat or Bullshit).
 
 RULES:
-- 52 cards are dealt among all players. Goal: be first to empty your hand.
-- Players take turns placing cards face-down and CLAIMING they match the current required rank.
-- Everyone can see HOW MANY cards were placed (actual count); they cannot see the faces until a challenge.
-- Ranks cycle: Ace → Two → Three → ... → King → Ace (repeating)
-- You MAY lie about the cards you play. Lying includes playing the wrong rank OR claiming a different count than the number of cards you put down.
-- After any play, any OTHER player can call "Bullshit" (challenge):
-    - If the player lied → they pick up the entire discard pile
-    - If the player was honest → the challenger picks up the pile
-- After a challenge (win or lose), the rank advances and play continues.
+- 108 cards are dealt (2 standard decks + 4 Jokers). Goal: be first to empty your hand.
+- Players take turns placing cards face-down, claiming they match the CURRENT required rank.
+- Jokers are wildcards — they count as any rank and are always honest.
+- Ranks cycle: A → 2 → 3 → ... → K → A (repeating). Max 8 real cards per rank per cycle.
+- You MAY lie: play wrong-rank cards while claiming the current rank.
+- After any play, any OTHER player can challenge ("Bullshit!"):
+    - Lied → liar picks up the entire discard pile.
+    - Honest → challenger picks up the pile.
+- First player to empty their hand wins."""
 
+_STRATEGY_BLOCK = """
 STRATEGIC PRINCIPLES:
-1. Your PRIMARY goal is to empty your hand. Every decision should serve this.
-2. Play honestly when you have matching cards — this is risk-free progress.
-3. When forced to bluff, play FEW cards (1 is safest) and claim a count that matches how many cards you actually place.
-4. Challenge SPARINGLY. Winning a challenge does not reduce YOUR hand.
-   Losing a challenge means YOU pick up the entire pile. Only challenge when you are highly confident AND the pile is small enough that a loss is acceptable.
-5. Lie frequency estimates come only from past CAUGHT lies — they are noisy, not gospel. A moderate number does not mean this specific play is a lie.
-6. Within one rank cycle (Ace through King once), at most 4 cards of a given rank exist in the deck. Totals can exceed 4 across later cycles because cards recycle through the discard pile.
+1. PRIMARY goal: empty your hand. Every decision serves this.
+2. Play honestly (real matches or Jokers) when you have them — risk-free progress.
+3. When forced to bluff, play FEW cards (1 is safest). Don't over-claim.
+4. Challenge SPARINGLY. Winning doesn't reduce YOUR hand. Losing means YOU pick up the pile.
+   Only challenge when you're highly confident AND the pile loss is acceptable.
+5. Lie frequency comes only from CAUGHT lies — a low history doesn't mean the current play is honest.
+6. With 2 decks, 8 of each rank exist per cycle. Claims totalling >8 for one rank are impossible."""
 
-OUTPUT FORMAT (strictly valid JSON):
-When it is YOUR TURN to PLAY:
-{
-  "action": "play",
-  "cards": ["CardString1", "CardString2"],
-  "claimed_count": N,
-  "reasoning": "brief explanation"
-}
+_COT_BLOCK = """
+Before outputting JSON, reason in the "reasoning" field:
+- Do I have matching cards or Jokers?
+- Am I winning or losing vs opponents?
+- If there's a last_claim: what's the probability it's a lie? What's my pile risk?"""
 
-When you are DECIDING WHETHER TO CHALLENGE (not your play turn):
-{
-  "action": "challenge",
-  "reasoning": "brief explanation"
-}
-or
-{
-  "action": "pass_challenge",
-  "reasoning": "brief explanation"
-}
+_FEW_SHOT_BLOCK = """
+EXAMPLES:
+
+Example 1 — Honest play:
+Rank=King. Hand has 2 Kings. → Play honestly.
+{"action": "play", "cards": ["K♠","K♥"], "claimed_rank": "K", "reasoning": "Have matching cards."}
+
+Example 2 — Forced minimal bluff:
+Rank=7. No 7s in hand. 18 cards in hand. → Bluff 1 card.
+{"action": "play", "cards": ["2♣"], "claimed_rank": "7", "reasoning": "No 7s. Minimal bluff."}
+
+Example 3 — Pass on challenge (pile too large):
+Last claim: 2 Aces. Pile=14. Opponent lie freq=0.1. My hand=8.
+{"action": "play", "cards": ["3♦"], "claimed_rank": "3", "reasoning": "Pile too large to risk."}
+
+Example 4 — Challenge (mathematically impossible):
+Total claimed this rank cycle: 9 (exceeds 8 max). Pile=4.
+{"action": "challenge", "reasoning": "9 claimed for this rank — exceeds 8 max. Certain lie."}"""
+
+_OUTPUT_BLOCK = """
+OUTPUT — strictly valid JSON, one of:
+
+Play (always specify claimed_rank = current required rank):
+{"action": "play", "cards": ["A♠","A♥"], "claimed_rank": "A", "reasoning": "..."}
+
+Challenge the last claim:
+{"action": "challenge", "reasoning": "..."}
 
 IMPORTANT: Output ONLY the JSON object. No other text."""
 
-PLAY_PROMPT_TEMPLATE = """
-=== GAME STATE (Turn {turn_number}) ===
 
-Required rank this turn: {current_rank}
-Rank cycle index (Ace..King rounds): {rank_cycle}
-
-My hand ({hand_size} cards): {hand_list}
-  - Cards matching current rank: {matching_count}x {current_rank}
-
-Hand sizes:
-{hand_sizes}
-
-Discard pile size: {discard_pile_size} cards
-
-Estimated lie frequencies from CAUGHT lies only (0.0 = never caught lying, higher = caught more often relative to turns):
-{lie_frequencies}
-
-Recent claim history (last 8 turns; "placed" = face-down cards actually put on pile):
-{claim_history}
-
-=== YOUR TURN TO PLAY ===
-Choose which cards to play from your hand and what count to claim (claimed_count must equal how many cards you list).
-"""
-
-CHALLENGE_PROMPT_TEMPLATE = """
-=== GAME STATE (Turn {turn_number}) ===
-
-Required rank this turn: {current_rank}
-Rank cycle index (Ace..King rounds): {rank_cycle}
-
-My hand ({hand_size} cards): {hand_list}
-  - Cards matching current rank: {matching_count}x {current_rank}
-
-Hand sizes:
-{hand_sizes}
-
-Discard pile size: {discard_pile_size} cards
-
-Estimated lie frequencies from CAUGHT lies only:
-{lie_frequencies}
-
-Recent claim history (last 8 turns):
-{claim_history}
-
-=== CHALLENGE DECISION ===
-Player {claimer_name} (ID={claimer_id}) placed {actual_cards_placed} card(s) face-down and claimed {claimed_count}x {current_rank}.
-Their estimated caught-lie frequency: {claimer_lie_freq:.2f}
-Total claimed count for {current_rank} in THIS rank cycle only (including this play): {total_rank_claimed}
-Maximum possible {current_rank}s in the deck in a single cycle: 4
-(Across multiple Ace→King rounds, more than 4 can be claimed in total because cards return to play via the pile.)
-
-Do you challenge (call "Bullshit") or pass?
-"""
+def _build_system_prompt(mode: str) -> str:
+    if mode == "zero_shot":
+        return _RULES_BLOCK + _OUTPUT_BLOCK
+    if mode == "few_shot":
+        return _RULES_BLOCK + _STRATEGY_BLOCK + _FEW_SHOT_BLOCK + _OUTPUT_BLOCK
+    return _RULES_BLOCK + _STRATEGY_BLOCK + _COT_BLOCK + _OUTPUT_BLOCK  # cot
 
 
 # ---------------------------------------------------------------------------
-# Card string parsing
+# User prompt template
 # ---------------------------------------------------------------------------
 
-RANK_LABEL_MAP = {r.label(): r for r in Rank}
-SUIT_SYMBOL_MAP = {s.value: s for s in Suit}
+_USER_PROMPT_TEMPLATE = """=== GAME STATE (Turn {turn}) ===
+Required rank: {current_rank}
+My hand ({my_hand_size} cards): {hand_str}
+  Matching current rank: {matching_count}x {current_rank}
+  Jokers: {joker_count}
+
+Opponent hand sizes: {opp_sizes_str}
+Discard pile: {pile_size} cards
+
+{last_claim_section}
+=== YOUR TURN ===
+{decision_prompt}"""
+
+_PLAY_DECISION = "Choose cards to play from your hand."
+_CHALLENGE_DECISION = """Player {claimer_id} just played {n_cards} card(s), claiming {n_cards}x {claimed_rank}.
+You can CHALLENGE their claim or play your own cards (implicitly passing the challenge)."""
 
 
-def parse_card_string(s: str) -> Card:
-    """Parse 'Ace♥' or 'King♠' etc. back to a Card object."""
-    for rank_label, rank in RANK_LABEL_MAP.items():
-        if s.startswith(rank_label):
-            suit_symbol = s[len(rank_label) :]
-            if suit_symbol in SUIT_SYMBOL_MAP:
-                return Card(rank, SUIT_SYMBOL_MAP[suit_symbol])
-    raise ValueError(f"Cannot parse card string: {s!r}")
-
+# ---------------------------------------------------------------------------
+# LLMAgent
+# ---------------------------------------------------------------------------
 
 def parse_model_spec(spec: str, default_provider: str) -> Tuple[str, str]:
-    """
-    'openai:gpt-4o' → ('openai', 'gpt-4o')
-    'grok-3' with MODEL_CONFIGS → ('xai', 'grok-3')
-    'custom-model' → (default_provider, 'custom-model')
-    """
     spec = spec.strip()
     if ":" in spec:
         prov, mod = spec.split(":", 1)
@@ -171,26 +150,20 @@ def parse_model_spec(spec: str, default_provider: str) -> Tuple[str, str]:
     return default_provider, spec
 
 
-# ---------------------------------------------------------------------------
-# LLMAgent
-# ---------------------------------------------------------------------------
-
-
 class LLMAgent(BaseAgent):
-    """
-    LLM player with pluggable provider (OpenAI-compatible, Anthropic, Google).
-    """
+    """LLM player with pluggable provider and prompt-mode ablation."""
 
     _ENV_KEYS = {
-        "xai": "XAI_API_KEY",
-        "openai": "OPENAI_API_KEY",
-        "local": "OPENAI_API_KEY",
+        "xai":       "XAI_API_KEY",
+        "openai":    "OPENAI_API_KEY",
+        "local":     "OPENAI_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
-        "google": "GOOGLE_API_KEY",
+        "google":    "GOOGLE_API_KEY",
     }
 
     def __init__(
         self,
+        player_id: int,
         name: str = "LLM",
         *,
         provider: str = "openai",
@@ -199,174 +172,195 @@ class LLMAgent(BaseAgent):
         max_retries: int = 3,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        prompt_mode: str = "cot",
+        memory_mode: str = "current_only",  # "current_only" | "full_history"
     ):
-        super().__init__(name)
+        super().__init__(player_id, name)
+        if prompt_mode not in PROMPT_MODES:
+            raise ValueError(f"prompt_mode must be one of {PROMPT_MODES}")
         self.provider = provider.lower().strip()
         self.model = model
         self.temperature = temperature
         self.max_retries = max_retries
         self.base_url = base_url
         self._api_key = api_key
+        self.prompt_mode = prompt_mode
+        self.memory_mode = memory_mode
+        self._system_prompt = _build_system_prompt(prompt_mode)
         self._openai_client: Optional[OpenAI] = None
+
+        # Runtime state
         self.reasoning_traces: List[dict] = []
         self.fallback_play_count: int = 0
+        self._history: List[str] = []    # accumulated turn summaries if full_history
+        self._last_belief: Optional[dict] = None
 
-    def _get_openai_client(self) -> OpenAI:
-        if self._openai_client is not None:
-            return self._openai_client
-        key = self._api_key
-        if not key:
-            env = self._ENV_KEYS.get(self.provider, "OPENAI_API_KEY")
-            key = os.environ.get(env, "")
-        if self.provider == "local" and not key:
-            key = "ollama"
-        if self.provider in ("openai", "xai") and not key:
-            raise ValueError(
-                f"API key not found for provider {self.provider!r}. "
-                f"Set {self._ENV_KEYS.get(self.provider)} or pass api_key=."
-            )
-        url = self.base_url
-        if url is None:
-            if self.provider == "xai":
-                url = "https://api.x.ai/v1"
-            elif self.provider == "local":
-                url = os.environ.get("OPENAI_BASE_URL", "http://localhost:11434/v1")
+    def reset(self) -> None:
+        self.reasoning_traces = []
+        self.fallback_play_count = 0
+        self._history = []
+        self._last_belief = None
+
+    def observe_event(self, event: Dict[str, Any]) -> None:
+        if self.memory_mode != "full_history":
+            return
+        atype = event.get("action", {}).get("type")
+        if atype == "play":
+            player = event["player"]
+            if player == self.player_id:
+                summary = (f"Turn {event['turn']}: I played {event['n_cards']}x "
+                           f"{event['claimed_rank']} ({'honest' if event.get('honest') else 'bluff'})")
             else:
-                url = None
-        kwargs: Dict[str, Any] = {"api_key": key}
-        if url:
-            kwargs["base_url"] = url
-        self._openai_client = OpenAI(**kwargs)
-        return self._openai_client
+                summary = (f"Turn {event['turn']}: P{player} claimed "
+                           f"{event['n_cards']}x {event['claimed_rank']}")
+        elif atype == "challenge":
+            result = event.get("challenge_result", "?")
+            summary = (f"Turn {event['turn']}: P{event['player']} challenged → "
+                       f"{result}, pile→P{event.get('pile_goes_to','?')}")
+        else:
+            return
+        self._history.append(summary)
 
-    def choose_play(self, state: "GameState", player_id: int) -> Tuple[List[Card], int]:
-        player = state.players[player_id]
-        prompt = self._build_play_prompt(state, player_id)
+    def report_belief(self, obs: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        return self._last_belief
+
+    def choose_action(self, obs: Dict[str, Any]) -> Dict[str, Any]:
+        prompt = self._build_prompt(obs)
         response = self._call_llm(prompt)
 
         if response is None:
             self.fallback_play_count += 1
-            return self._fallback_play(player, state.current_rank)
+            return self._fallback_action(obs)
 
-        self._record_trace(state, player_id, "play", response)
+        self._record_trace(obs, response)
 
         try:
-            return self._parse_play_response(response, player, state.current_rank)
+            return self._parse_response(response, obs)
         except Exception as e:
-            logger.warning(f"Failed to parse play response: {e}. Using fallback.")
+            logger.warning("Failed to parse LLM response: %s — using fallback", e)
             self.fallback_play_count += 1
-            return self._fallback_play(player, state.current_rank)
+            return self._fallback_action(obs)
 
-    def choose_challenge(self, state: "GameState", player_id: int, claim: "ClaimRecord") -> bool:
-        prompt = self._build_challenge_prompt(state, player_id, claim)
-        response = self._call_llm(prompt)
+    # ------------------------------------------------------------------
+    # Prompt building
+    # ------------------------------------------------------------------
 
-        if response is None:
-            return False
+    def _build_prompt(self, obs: Dict[str, Any]) -> str:
+        rank = obs["current_rank"]
+        hand: List[Card] = obs["my_hand"]
+        opp_sizes: Dict[int, int] = obs.get("opponent_hand_sizes", {})
+        lc = obs.get("last_claim")
 
-        self._record_trace(state, player_id, "challenge", response)
+        matching = [c for c in hand if c.rank == rank]
+        jokers = [c for c in hand if c.rank == JOKER_RANK]
+        hand_str = ", ".join(str(c) for c in hand) if hand else "(empty)"
+        opp_str = "  ".join(f"P{pid}:{sz}" for pid, sz in sorted(opp_sizes.items()))
 
-        try:
-            return self._parse_challenge_response(response)
-        except Exception as e:
-            logger.warning(f"Failed to parse challenge response: {e}. Defaulting to no challenge.")
-            return False
+        if lc and lc["player_id"] != self.player_id:
+            last_claim_section = (
+                f"Last claim: P{lc['player_id']} played {lc['n_cards']} card(s) "
+                f"claiming {lc['n_cards']}x {lc['claimed_rank']}"
+            )
+            decision_prompt = _CHALLENGE_DECISION.format(
+                claimer_id=lc["player_id"],
+                n_cards=lc["n_cards"],
+                claimed_rank=lc["claimed_rank"],
+            )
+        else:
+            last_claim_section = "Last claim: None (game start or post-challenge)"
+            decision_prompt = _PLAY_DECISION
 
-    def _build_play_prompt(self, state: "GameState", player_id: int) -> str:
-        player = state.players[player_id]
-        rank = state.current_rank
-        obs = state.get_public_observation(player_id)
+        history_section = ""
+        if self.memory_mode == "full_history" and self._history:
+            recent = self._history[-8:]
+            history_section = "\nRecent history:\n" + "\n".join(f"  {h}" for h in recent) + "\n"
 
-        hand_list = ", ".join(str(c) for c in player.hand)
-        matching_count = player.count_rank(rank)
-
-        hand_sizes_str = "\n".join(
-            f"  Player {pid} ({state.players[pid].name}): {size} cards"
-            for pid, size in obs["hand_sizes"].items()
-            if pid != player_id
+        return history_section + _USER_PROMPT_TEMPLATE.format(
+            turn=obs["turn"],
+            current_rank=rank,
+            my_hand_size=obs["my_hand_size"],
+            hand_str=hand_str,
+            matching_count=len(matching),
+            joker_count=len(jokers),
+            opp_sizes_str=opp_str or "N/A",
+            pile_size=obs["pile_size"],
+            last_claim_section=last_claim_section,
+            decision_prompt=decision_prompt,
         )
 
-        lie_freq_str = "\n".join(
-            f"  Player {pid} ({state.players[pid].name}): {freq:.2f}"
-            for pid, freq in obs["lie_frequencies"].items()
-            if pid != player_id
-        )
+    # ------------------------------------------------------------------
+    # Response parsing
+    # ------------------------------------------------------------------
 
-        history = obs["claim_history"][-8:]
-        history_str = "\n".join(
-            f"  Turn {i}: P{r['player']} placed {r.get('actual_cards_placed', '?')} card(s), "
-            f"claimed {r['claimed_count']}x {r['claimed_rank']}"
-            + (f" → CHALLENGED ({r['challenge_result']})" if r["was_challenged"] else "")
-            for i, r in enumerate(history)
-        ) or "  (No claims yet)"
+    def _parse_response(self, response: dict, obs: Dict[str, Any]) -> Dict[str, Any]:
+        action = response.get("action", "play")
+        self._last_belief = {"reasoning": response.get("reasoning", "")}
 
-        return PLAY_PROMPT_TEMPLATE.format(
-            turn_number=state.turn_number,
-            current_rank=rank.label(),
-            rank_cycle=obs.get("current_rank_cycle", state.current_rank_cycle),
-            hand_size=player.hand_size,
-            hand_list=hand_list,
-            matching_count=matching_count,
-            hand_sizes=hand_sizes_str,
-            discard_pile_size=state.discard_pile_size,
-            lie_frequencies=lie_freq_str,
-            claim_history=history_str,
-        )
+        if action == "challenge":
+            lc = obs.get("last_claim")
+            if lc and lc["player_id"] != self.player_id:
+                return {"type": "challenge"}
+            # Can't challenge — fall through to play
+            logger.warning("LLM wanted to challenge but no valid last_claim — playing instead")
 
-    def _build_challenge_prompt(self, state: "GameState", player_id: int, claim: "ClaimRecord") -> str:
-        player = state.players[player_id]
-        rank = state.current_rank
-        obs = state.get_public_observation(player_id)
+        # Parse play
+        rank = obs["current_rank"]
+        hand: List[Card] = obs["my_hand"]
+        card_strings: List[str] = response.get("cards", [])
+        claimed_rank: str = response.get("claimed_rank", rank)
 
-        hand_list = ", ".join(str(c) for c in player.hand)
-        matching_count = player.count_rank(rank)
+        # Enforce claimed_rank == current_rank (engine rule)
+        if claimed_rank != rank:
+            logger.warning("LLM claimed rank %r but current rank is %r — correcting", claimed_rank, rank)
+            claimed_rank = rank
 
-        hand_sizes_str = "\n".join(
-            f"  Player {pid} ({state.players[pid].name}): {size} cards"
-            for pid, size in obs["hand_sizes"].items()
-            if pid != player_id
-        )
+        # Resolve card strings to actual Card objects in hand
+        hand_lookup: Dict[str, List[Card]] = defaultdict(list)
+        for c in hand:
+            hand_lookup[str(c)].append(c)
 
-        lie_freq_str = "\n".join(
-            f"  Player {pid} ({state.players[pid].name}): {freq:.2f}"
-            for pid, freq in obs["lie_frequencies"].items()
-            if pid != player_id
-        )
+        parsed: List[Card] = []
+        for cs in card_strings:
+            if cs in hand_lookup and hand_lookup[cs]:
+                parsed.append(hand_lookup[cs].pop(0))
 
-        history = obs["claim_history"][-8:]
-        history_str = "\n".join(
-            f"  Turn {i}: P{r['player']} placed {r.get('actual_cards_placed', '?')} card(s), "
-            f"claimed {r['claimed_count']}x {r['claimed_rank']}"
-            + (f" → CHALLENGED ({r['challenge_result']})" if r["was_challenged"] else "")
-            for i, r in enumerate(history)
-        ) or "  (No claims yet)"
+        if not parsed:
+            self.fallback_play_count += 1
+            return self._fallback_action(obs)
 
-        claimer_lie_freq = obs["lie_frequencies"].get(claim.player_id, 0.0)
-        cycle = claim.rank_cycle
-        total_rank_claimed = sum(
-            r["claimed_count"]
-            for r in obs["claim_history"]
-            if r["claimed_rank"] == rank.label() and r.get("rank_cycle", cycle) == cycle
-        ) + claim.claimed_count
+        return {"type": "play", "cards": parsed, "claimed_rank": claimed_rank}
 
-        return CHALLENGE_PROMPT_TEMPLATE.format(
-            turn_number=state.turn_number,
-            current_rank=rank.label(),
-            rank_cycle=obs.get("current_rank_cycle", state.current_rank_cycle),
-            hand_size=player.hand_size,
-            hand_list=hand_list,
-            matching_count=matching_count,
-            hand_sizes=hand_sizes_str,
-            discard_pile_size=state.discard_pile_size,
-            lie_frequencies=lie_freq_str,
-            claim_history=history_str,
-            claimer_name=state.players[claim.player_id].name,
-            claimer_id=claim.player_id,
-            claimed_count=claim.claimed_count,
-            actual_cards_placed=len(claim.actual_cards),
-            claimer_lie_freq=claimer_lie_freq,
-            total_rank_claimed=total_rank_claimed,
-        )
+    def _fallback_action(self, obs: Dict[str, Any]) -> Dict[str, Any]:
+        rank = obs["current_rank"]
+        hand: List[Card] = obs["my_hand"]
+        if not hand:
+            return {"type": "play", "cards": [], "claimed_rank": rank}
+        matching = [c for c in hand if c.rank == rank]
+        if matching:
+            return {"type": "play", "cards": [matching[0]], "claimed_rank": rank}
+        jokers = [c for c in hand if c.rank == JOKER_RANK]
+        if jokers:
+            return {"type": "play", "cards": [jokers[0]], "claimed_rank": rank}
+        return {"type": "play", "cards": [hand[0]], "claimed_rank": rank}
+
+    def _record_trace(self, obs: Dict[str, Any], response: dict) -> None:
+        self.reasoning_traces.append({
+            "turn": obs["turn"],
+            "player_id": self.player_id,
+            "prompt_mode": self.prompt_mode,
+            "current_rank": obs["current_rank"],
+            "hand_size": obs["my_hand_size"],
+            "pile_size": obs["pile_size"],
+            "had_last_claim": obs.get("last_claim") is not None,
+            "reasoning": response.get("reasoning", ""),
+            "action": response.get("action"),
+            "cards": response.get("cards", []),
+            "claimed_rank": response.get("claimed_rank"),
+        })
+
+    # ------------------------------------------------------------------
+    # API calls
+    # ------------------------------------------------------------------
 
     def _call_llm(self, user_prompt: str) -> Optional[dict]:
         if self.provider in ("openai", "xai", "local"):
@@ -383,35 +377,53 @@ class LLMAgent(BaseAgent):
         content = re.sub(r"\s*```$", "", content)
         return json.loads(content)
 
+    def _get_openai_client(self) -> OpenAI:
+        if self._openai_client:
+            return self._openai_client
+        key = self._api_key or os.environ.get(self._ENV_KEYS.get(self.provider, "OPENAI_API_KEY"), "")
+        if self.provider == "local" and not key:
+            key = "ollama"
+        if self.provider in ("openai", "xai") and not key:
+            raise ValueError(f"API key not set for provider {self.provider!r}")
+        url = self.base_url
+        if url is None and self.provider == "xai":
+            url = "https://api.x.ai/v1"
+        elif url is None and self.provider == "local":
+            url = os.environ.get("OPENAI_BASE_URL", "http://localhost:11434/v1")
+        kwargs: Dict[str, Any] = {"api_key": key}
+        if url:
+            kwargs["base_url"] = url
+        self._openai_client = OpenAI(**kwargs)
+        return self._openai_client
+
     def _call_openai_compatible(self, user_prompt: str) -> Optional[dict]:
         client = self._get_openai_client()
         content = ""
         for attempt in range(self.max_retries):
             try:
-                response = client.chat.completions.create(
+                resp = client.chat.completions.create(
                     model=self.model,
                     messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt},
+                        {"role": "system", "content": self._system_prompt},
+                        {"role": "user",   "content": user_prompt},
                     ],
                     temperature=self.temperature,
                     max_tokens=512,
                 )
-                content = (response.choices[0].message.content or "").strip()
+                content = (resp.choices[0].message.content or "").strip()
                 return self._parse_json_content(content)
             except json.JSONDecodeError as e:
-                logger.warning(f"JSON parse error on attempt {attempt + 1}: {e}\nContent: {content!r}")
+                logger.warning("JSON parse error attempt %s: %s", attempt + 1, e)
             except Exception as e:
-                logger.warning(f"API error on attempt {attempt + 1}: {e}")
+                logger.warning("API error attempt %s: %s", attempt + 1, e)
         return None
 
     def _call_anthropic(self, user_prompt: str) -> Optional[dict]:
         try:
             import anthropic
-        except ImportError as e:
-            raise ImportError("Install anthropic: pip install anthropic") from e
-
-        key = self._api_key or os.environ.get("ANTHROPIC_API_KEY")
+        except ImportError as exc:
+            raise ImportError("pip install anthropic") from exc
+        key = self._api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         if not key:
             raise ValueError("ANTHROPIC_API_KEY not set")
         client = anthropic.Anthropic(api_key=key)
@@ -422,126 +434,38 @@ class LLMAgent(BaseAgent):
                     model=self.model,
                     max_tokens=512,
                     temperature=self.temperature,
-                    system=SYSTEM_PROMPT,
+                    system=self._system_prompt,
                     messages=[{"role": "user", "content": user_prompt}],
                 )
-                content = ""
-                for block in msg.content:
-                    if hasattr(block, "text"):
-                        content += block.text
-                content = content.strip()
+                content = "".join(b.text for b in msg.content if hasattr(b, "text")).strip()
                 return self._parse_json_content(content)
             except json.JSONDecodeError as e:
-                logger.warning(f"JSON parse error on attempt {attempt + 1}: {e}\nContent: {content!r}")
+                logger.warning("JSON parse error attempt %s: %s", attempt + 1, e)
             except Exception as e:
-                logger.warning(f"Anthropic API error on attempt {attempt + 1}: {e}")
+                logger.warning("Anthropic API error attempt %s: %s", attempt + 1, e)
         return None
 
     def _call_google(self, user_prompt: str) -> Optional[dict]:
         try:
             import google.generativeai as genai
-        except ImportError as e:
-            raise ImportError("Install google-generativeai: pip install google-generativeai") from e
-
-        key = self._api_key or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        except ImportError as exc:
+            raise ImportError("pip install google-generativeai") from exc
+        key = self._api_key or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY", "")
         if not key:
-            raise ValueError("GOOGLE_API_KEY or GEMINI_API_KEY not set")
+            raise ValueError("GOOGLE_API_KEY not set")
         genai.configure(api_key=key)
         content = ""
         for attempt in range(self.max_retries):
             try:
-                model = genai.GenerativeModel(
-                    self.model,
-                    system_instruction=SYSTEM_PROMPT,
-                )
-                resp = model.generate_content(
+                m = genai.GenerativeModel(self.model, system_instruction=self._system_prompt)
+                resp = m.generate_content(
                     user_prompt,
-                    generation_config={
-                        "temperature": self.temperature,
-                        "max_output_tokens": 512,
-                    },
+                    generation_config={"temperature": self.temperature, "max_output_tokens": 512},
                 )
                 content = (resp.text or "").strip()
                 return self._parse_json_content(content)
             except json.JSONDecodeError as e:
-                logger.warning(f"JSON parse error on attempt {attempt + 1}: {e}\nContent: {content!r}")
+                logger.warning("JSON parse error attempt %s: %s", attempt + 1, e)
             except Exception as e:
-                logger.warning(f"Google API error on attempt {attempt + 1}: {e}")
+                logger.warning("Google API error attempt %s: %s", attempt + 1, e)
         return None
-
-    def _parse_play_response(self, response: dict, player, rank: Rank) -> Tuple[List[Card], int]:
-        action = response.get("action", "play")
-        if action != "play":
-            self.fallback_play_count += 1
-            return self._fallback_play(player, rank)
-
-        card_strings = response.get("cards", [])
-        claimed_count = int(response.get("claimed_count", 1))
-
-        hand_lookup: Dict[str, List[Card]] = {}
-        for c in player.hand:
-            key = str(c)
-            hand_lookup.setdefault(key, []).append(c)
-
-        parsed_cards: List[Card] = []
-        for cs in card_strings:
-            if cs in hand_lookup and hand_lookup[cs]:
-                parsed_cards.append(hand_lookup[cs].pop(0))
-
-        if not parsed_cards:
-            self.fallback_play_count += 1
-            return self._fallback_play(player, rank)
-
-        claimed_count = max(1, min(4, claimed_count))
-        return parsed_cards, claimed_count
-
-    def _parse_challenge_response(self, response: dict) -> bool:
-        return response.get("action") == "challenge"
-
-    def _fallback_play(self, player, rank: Rank) -> Tuple[List[Card], int]:
-        import random
-
-        matching = [c for c in player.hand if c.rank == rank]
-        if matching:
-            return [matching[0]], 1
-        return [random.choice(player.hand)], 1
-
-    def _record_trace(self, state: "GameState", player_id: int, phase: str, response: dict) -> None:
-        self.reasoning_traces.append(
-            {
-                "turn": state.turn_number,
-                "player_id": player_id,
-                "phase": phase,
-                "current_rank": state.current_rank.label(),
-                "hand_size": state.players[player_id].hand_size,
-                "reasoning": response.get("reasoning", ""),
-                "action": response.get("action"),
-                "claimed_count": response.get("claimed_count"),
-            }
-        )
-
-
-class GrokAgent(LLMAgent):
-    """Backward-compatible alias: xAI Grok with OpenAI-compatible API."""
-
-    DEFAULT_MODEL = "grok-3"
-
-    def __init__(
-        self,
-        name: str = "Grok",
-        model: Optional[str] = None,
-        **kwargs: Any,
-    ):
-        api_key = kwargs.get("api_key") or os.environ.get("XAI_API_KEY")
-        if not api_key:
-            raise ValueError(
-                "xAI API key not found. Set XAI_API_KEY environment variable "
-                "or pass api_key= to GrokAgent()."
-            )
-        kwargs = {**kwargs, "api_key": api_key}
-        kwargs.setdefault("provider", "xai")
-        super().__init__(
-            name=name,
-            model=model or self.DEFAULT_MODEL,
-            **kwargs,
-        )
