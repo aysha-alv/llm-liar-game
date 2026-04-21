@@ -4,9 +4,12 @@ Multi-provider LLM agent for Liar (Cheat/Bullshit).
 Implements the new engine interface: choose_action(obs) -> action dict.
 Supports OpenAI-compatible APIs (OpenAI, xAI/Grok, Ollama), Anthropic, and Google Gemini.
 
-Prompt modes:
+Uses structured SYSTEM_PROMPT + PLAY_PROMPT_TEMPLATE + CHALLENGE_PROMPT_TEMPLATE.
+Deck is 108 cards (2 standard decks + 4 Jokers): max 8 honest cards per rank per cycle.
+
+Prompt modes (all use the same structured templates — mode controls the SYSTEM_PROMPT):
   zero_shot  — rules only, no strategic guidance
-  cot        — rules + strategy + explicit chain-of-thought instruction (default)
+  cot        — rules + strategy + step-by-step reasoning hints (default)
   few_shot   — rules + strategy + worked examples
 """
 from __future__ import annotations
@@ -15,15 +18,12 @@ import logging
 import os
 import re
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
 from .base import BaseAgent
-from engine.card import Card, JOKER_RANK, card_from_str
-
-if TYPE_CHECKING:
-    pass
+from engine.card import Card, JOKER_RANK, RANKS
 
 logger = logging.getLogger(__name__)
 
@@ -34,109 +34,283 @@ PROMPT_MODES = {"zero_shot", "cot", "few_shot"}
 # ---------------------------------------------------------------------------
 
 MODEL_CONFIGS: Dict[str, Dict[str, str]] = {
-    "grok-3":              {"provider": "xai",       "model": "grok-3"},
-    "gpt-4o":              {"provider": "openai",    "model": "gpt-4o"},
-    "gpt-4o-mini":         {"provider": "openai",    "model": "gpt-4o-mini"},
-    "claude-sonnet-4-5":   {"provider": "anthropic", "model": "claude-sonnet-4-5"},
-    "gemini-2.0-flash":    {"provider": "google",    "model": "gemini-2.0-flash"},
+    "grok-3":            {"provider": "xai",       "model": "grok-3"},
+    "gpt-4o":            {"provider": "openai",    "model": "gpt-4o"},
+    "gpt-4o-mini":       {"provider": "openai",    "model": "gpt-4o-mini"},
+    "claude-sonnet-4-5": {"provider": "anthropic", "model": "claude-sonnet-4-5"},
+    "gemini-2.0-flash":  {"provider": "google",    "model": "gemini-2.0-flash"},
 }
 
 # ---------------------------------------------------------------------------
-# Prompt blocks
+# System prompts (one per mode)
 # ---------------------------------------------------------------------------
 
-_RULES_BLOCK = """You are a player of the card game Liar (also called Cheat or Bullshit).
+_SYSTEM_ZERO_SHOT = """You are an expert player of the card game Liar (also called Cheat or Bullshit).
+A 108-card deck (two standard decks + 4 Jokers) is dealt among all players. Your goal: be the FIRST to empty your hand.
 
-RULES:
-- 108 cards are dealt (2 standard decks + 4 Jokers). Goal: be first to empty your hand.
-- Players take turns placing cards face-down, claiming they match the CURRENT required rank.
-- Jokers are wildcards — they count as any rank and are always honest.
-- Ranks cycle: A → 2 → 3 → ... → K → A (repeating). Max 8 real cards per rank per cycle.
-- You MAY lie: play wrong-rank cards while claiming the current rank.
-- After any play, any OTHER player can challenge ("Bullshit!"):
-    - Lied → liar picks up the entire discard pile.
-    - Honest → challenger picks up the pile.
-- First player to empty their hand wins."""
+═══ RULES ═══
 
-_STRATEGY_BLOCK = """
-STRATEGIC PRINCIPLES:
-1. PRIMARY goal: empty your hand. Every decision serves this.
-2. Play honestly (real matches or Jokers) when you have them — risk-free progress.
-3. When forced to bluff, play FEW cards (1 is safest). Don't over-claim.
-4. Challenge SPARINGLY. Winning doesn't reduce YOUR hand. Losing means YOU pick up the pile.
-   Only challenge when you're highly confident AND the pile loss is acceptable.
-5. Lie frequency comes only from CAUGHT lies — a low history doesn't mean the current play is honest.
-6. With 2 decks, 8 of each rank exist per cycle. Claims totalling >8 for one rank are impossible."""
+1. TURNS: On your turn you MUST place 1–4 cards face-down and CLAIM they are the current required rank.
+2. VISIBILITY: All players see HOW MANY cards you placed. Nobody sees the faces until a challenge.
+3. LYING: You may lie about the rank of the cards you play. Your claimed_count must equal the number of cards you actually place.
+4. RANK CYCLE: The required rank advances each turn: Ace → Two → Three → … → King → Ace → Two → …
+   Each full Ace-through-King pass is one "rank cycle."
+5. CHALLENGES: After any play, any OTHER player may call "Bullshit":
+   • If the player LIED (wrong rank) → the liar picks up the ENTIRE discard pile.
+   • If the player was HONEST → the challenger picks up the ENTIRE discard pile.
+   After a challenge the rank still advances and play continues.
+6. EIGHT-CARD RULE: Two decks means 8 cards of each rank exist.
+   Within a SINGLE rank cycle, at most 8 of any rank can truthfully be played.
+   If total claims for a rank EXCEED 8 within the same cycle, someone MUST be lying.
+   (Jokers count as wildcards and are always honest.)
 
-_COT_BLOCK = """
-Before outputting JSON, reason in the "reasoning" field:
-- Do I have matching cards or Jokers?
-- Am I winning or losing vs opponents?
-- If there's a last_claim: what's the probability it's a lie? What's my pile risk?"""
+═══ CARD FORMAT ═══
 
-_FEW_SHOT_BLOCK = """
-EXAMPLES:
+Cards are written as RankSuit with Unicode suit symbols.
+Examples: Ace♥  Two♦  Ten♣  King♠  Queen♥  Jack♦  Three♠  Seven♣  Joker★
+ONLY use cards that appear in "My hand" below. Do NOT invent cards.
 
-Example 1 — Honest play:
-Rank=King. Hand has 2 Kings. → Play honestly.
-{"action": "play", "cards": ["K♠","K♥"], "claimed_rank": "K", "reasoning": "Have matching cards."}
+═══ OUTPUT FORMAT ═══
 
-Example 2 — Forced minimal bluff:
-Rank=7. No 7s in hand. 18 cards in hand. → Bluff 1 card.
-{"action": "play", "cards": ["2♣"], "claimed_rank": "7", "reasoning": "No 7s. Minimal bluff."}
+Respond with ONLY a single JSON object. No markdown, no commentary, no extra text.
 
-Example 3 — Pass on challenge (pile too large):
-Last claim: 2 Aces. Pile=14. Opponent lie freq=0.1. My hand=8.
-{"action": "play", "cards": ["3♦"], "claimed_rank": "3", "reasoning": "Pile too large to risk."}
+When it is YOUR TURN TO PLAY:
+{
+  "action": "play",
+  "cards": ["Ace♥", "Ace♣"],
+  "claimed_count": 2,
+  "reasoning": "I have 2 Aces, so I play them both honestly."
+}
 
-Example 4 — Challenge (mathematically impossible):
-Total claimed this rank cycle: 9 (exceeds 8 max). Pile=4.
-{"action": "challenge", "reasoning": "9 claimed for this rank — exceeds 8 max. Certain lie."}"""
+RULES for the play action:
+- "cards" must list ONLY cards currently in your hand (exact RankSuit strings).
+- "claimed_count" must EQUAL the number of cards in "cards" (1–4).
+- You may play cards of ANY rank, but you are CLAIMING they match the required rank.
 
-_OUTPUT_BLOCK = """
-OUTPUT — strictly valid JSON, one of:
+When you are DECIDING WHETHER TO CHALLENGE another player's play:
+{
+  "action": "challenge",
+  "reasoning": "Total Aces claimed this cycle is 9, exceeding the 8-card maximum."
+}
+or
+{
+  "action": "pass_challenge",
+  "reasoning": "Only 2 Aces claimed so far, plausible. Pile is large, too risky."
+}
 
-Play (always specify claimed_rank = current required rank):
-{"action": "play", "cards": ["A♠","A♥"], "claimed_rank": "A", "reasoning": "..."}
+IMPORTANT: Output ONLY the JSON object. No other text before or after."""
 
-Challenge the last claim:
-{"action": "challenge", "reasoning": "..."}
+_SYSTEM_COT = """You are an expert player of the card game Liar (also called Cheat or Bullshit).
+A 108-card deck (two standard decks + 4 Jokers) is dealt among all players. Your goal: be the FIRST to empty your hand.
 
-IMPORTANT: Output ONLY the JSON object. No other text."""
+═══ RULES ═══
+
+1. TURNS: On your turn you MUST place 1–4 cards face-down and CLAIM they are the current required rank.
+2. VISIBILITY: All players see HOW MANY cards you placed. Nobody sees the faces until a challenge.
+3. LYING: You may lie about the rank of the cards you play. Your claimed_count must equal the number of cards you actually place.
+4. RANK CYCLE: The required rank advances each turn: Ace → Two → Three → … → King → Ace → Two → …
+   Each full Ace-through-King pass is one "rank cycle."
+5. CHALLENGES: After any play, any OTHER player may call "Bullshit":
+   • If the player LIED (wrong rank) → the liar picks up the ENTIRE discard pile.
+   • If the player was HONEST → the challenger picks up the ENTIRE discard pile.
+   After a challenge the rank still advances and play continues.
+6. EIGHT-CARD RULE: Two decks means 8 cards of each rank exist.
+   Within a SINGLE rank cycle, at most 8 of any rank can truthfully be played.
+   If total claims for a rank EXCEED 8 within the same cycle, someone MUST be lying.
+   (Jokers count as wildcards and are always honest.)
+
+═══ CARD FORMAT ═══
+
+Cards are written as RankSuit with Unicode suit symbols.
+Examples: Ace♥  Two♦  Ten♣  King♠  Queen♥  Jack♦  Three♠  Seven♣  Joker★
+ONLY use cards that appear in "My hand" below. Do NOT invent cards.
+
+═══ STRATEGY GUIDELINES ═══
+
+• PLAY HONESTLY when you have matching cards — it is risk-free progress toward emptying your hand.
+• When you MUST bluff, play as FEW cards as possible (1 is safest). Pick cards from ranks you have many of (expendable).
+• CHALLENGE only when you are HIGHLY confident AND the discard pile is small enough that losing the challenge is survivable.
+  Winning a challenge does NOT reduce YOUR hand. Losing means YOU pick up the entire pile.
+• A player's "caught-lie frequency" is noisy — it only counts CAUGHT lies, not undetected ones.
+  A low frequency does NOT mean they are honest; a moderate one does NOT mean this specific play is a lie.
+• ALWAYS check: do the total claims for this rank in the current cycle exceed 8? If yes, someone is certainly lying.
+
+═══ OUTPUT FORMAT ═══
+
+Respond with ONLY a single JSON object. No markdown, no commentary, no extra text.
+
+When it is YOUR TURN TO PLAY:
+{
+  "action": "play",
+  "cards": ["Ace♥", "Ace♣"],
+  "claimed_count": 2,
+  "reasoning": "I have 2 Aces, so I play them both honestly."
+}
+
+RULES for the play action:
+- "cards" must list ONLY cards currently in your hand (exact RankSuit strings).
+- "claimed_count" must EQUAL the number of cards in "cards" (1–4).
+- You may play cards of ANY rank, but you are CLAIMING they match the required rank.
+
+When you are DECIDING WHETHER TO CHALLENGE another player's play:
+{
+  "action": "challenge",
+  "reasoning": "Total Aces claimed this cycle is 9, exceeding the 8-card maximum."
+}
+or
+{
+  "action": "pass_challenge",
+  "reasoning": "Only 2 Aces claimed so far, plausible. Pile is large, too risky."
+}
+
+IMPORTANT: Output ONLY the JSON object. No other text before or after."""
+
+_SYSTEM_FEW_SHOT = """You are an expert player of the card game Liar (also called Cheat or Bullshit).
+A 108-card deck (two standard decks + 4 Jokers) is dealt among all players. Your goal: be the FIRST to empty your hand.
+
+═══ RULES ═══
+
+1. TURNS: On your turn you MUST place 1–4 cards face-down and CLAIM they are the current required rank.
+2. VISIBILITY: All players see HOW MANY cards you placed. Nobody sees the faces until a challenge.
+3. LYING: You may lie about the rank of the cards you play. Your claimed_count must equal the number of cards you actually place.
+4. RANK CYCLE: The required rank advances each turn: Ace → Two → Three → … → King → Ace → Two → …
+   Each full Ace-through-King pass is one "rank cycle."
+5. CHALLENGES: After any play, any OTHER player may call "Bullshit":
+   • If the player LIED (wrong rank) → the liar picks up the ENTIRE discard pile.
+   • If the player was HONEST → the challenger picks up the ENTIRE discard pile.
+   After a challenge the rank still advances and play continues.
+6. EIGHT-CARD RULE: Two decks means 8 cards of each rank exist.
+   Within a SINGLE rank cycle, at most 8 of any rank can truthfully be played.
+   If total claims for a rank EXCEED 8 within the same cycle, someone MUST be lying.
+   (Jokers count as wildcards and are always honest.)
+
+═══ CARD FORMAT ═══
+
+Cards are written as RankSuit with Unicode suit symbols.
+Examples: Ace♥  Two♦  Ten♣  King♠  Queen♥  Jack♦  Three♠  Seven♣  Joker★
+ONLY use cards that appear in "My hand" below. Do NOT invent cards.
+
+═══ STRATEGY GUIDELINES ═══
+
+• PLAY HONESTLY when you have matching cards — it is risk-free progress toward emptying your hand.
+• When you MUST bluff, play as FEW cards as possible (1 is safest). Pick cards from ranks you have many of (expendable).
+• CHALLENGE only when you are HIGHLY confident AND the discard pile is small enough that losing the challenge is survivable.
+  Winning a challenge does NOT reduce YOUR hand. Losing means YOU pick up the entire pile.
+• A player's "caught-lie frequency" is noisy — it only counts CAUGHT lies, not undetected ones.
+• ALWAYS check: do the total claims for this rank in the current cycle exceed 8? If yes, someone is certainly lying.
+
+═══ EXAMPLES ═══
+
+Example 1 — Honest play (have matching cards):
+Rank=King. My hand has King♠, King♥, Three♦. → Play both Kings honestly.
+{"action": "play", "cards": ["King♠","King♥"], "claimed_count": 2, "reasoning": "Have 2 Kings — play honestly, risk-free."}
+
+Example 2 — Minimal bluff (no matching cards):
+Rank=Seven. My hand has no Sevens. 18 cards in hand. → Bluff 1 expendable card.
+{"action": "play", "cards": ["Two♣"], "claimed_count": 1, "reasoning": "No Sevens. Play 1 expendable card, claim 1 to minimise suspicion."}
+
+Example 3 — Pass challenge (pile too large to risk):
+Last claim: 2 Aces, pile=14 cards. Opponent lie freq=0.10. My hand=8 cards.
+{"action": "pass_challenge", "reasoning": "Losing adds 14 cards. Low observed lie rate. Not worth the risk."}
+
+Example 4 — Challenge (mathematically certain):
+Total Aces claimed this cycle: 9 (exceeds 8 max for 2 decks). Pile=4.
+{"action": "challenge", "reasoning": "9 Aces claimed this cycle but only 8 exist. Certain lie."}
+
+═══ OUTPUT FORMAT ═══
+
+Respond with ONLY a single JSON object. No markdown, no commentary, no extra text.
+
+When it is YOUR TURN TO PLAY:
+{"action": "play", "cards": ["Ace♥","Ace♣"], "claimed_count": 2, "reasoning": "..."}
+
+When deciding whether to CHALLENGE:
+{"action": "challenge", "reasoning": "..."} or {"action": "pass_challenge", "reasoning": "..."}
+
+IMPORTANT: Output ONLY the JSON object. No other text before or after."""
 
 
 def _build_system_prompt(mode: str) -> str:
     if mode == "zero_shot":
-        return _RULES_BLOCK + _OUTPUT_BLOCK
+        return _SYSTEM_ZERO_SHOT
     if mode == "few_shot":
-        return _RULES_BLOCK + _STRATEGY_BLOCK + _FEW_SHOT_BLOCK + _OUTPUT_BLOCK
-    return _RULES_BLOCK + _STRATEGY_BLOCK + _COT_BLOCK + _OUTPUT_BLOCK  # cot
+        return _SYSTEM_FEW_SHOT
+    return _SYSTEM_COT  # cot (default)
 
 
 # ---------------------------------------------------------------------------
-# User prompt template
+# Prompt templates (adapted from prompt_1.md for 108-card deck)
 # ---------------------------------------------------------------------------
 
-_USER_PROMPT_TEMPLATE = """=== GAME STATE (Turn {turn}) ===
-Required rank: {current_rank}
-My hand ({my_hand_size} cards): {hand_str}
-  Matching current rank: {matching_count}x {current_rank}
-  Jokers: {joker_count}
+PLAY_PROMPT_TEMPLATE = """
+═══ GAME STATE (Turn {turn_number}) ═══
 
-Opponent hand sizes: {opp_sizes_str}
-Discard pile: {pile_size} cards
+Required rank this turn: {current_rank}
+Rank cycle: {rank_cycle} (Ace→King round #{rank_cycle})
 
-{last_claim_section}
-=== YOUR TURN ===
-{decision_prompt}"""
+My hand ({hand_size} cards): {hand_list}
+  → Matching cards ({current_rank}): {matching_count}
 
-_PLAY_DECISION = "Choose cards to play from your hand."
-_CHALLENGE_DECISION = """Player {claimer_id} just played {n_cards} card(s), claiming {n_cards}x {claimed_rank}.
-You can CHALLENGE their claim or play your own cards (implicitly passing the challenge)."""
+Other players' hand sizes:
+{hand_sizes}
+
+Discard pile: {discard_pile_size} cards
+
+Caught-lie frequencies (fraction of turns where each player was CAUGHT lying):
+{lie_frequencies}
+
+Recent history (last 8 turns):
+{claim_history}
+
+═══ YOUR TURN TO PLAY ═══
+Step 1: Check how many {current_rank}s you have in your hand.
+Step 2: If you have matching cards, play them honestly (safest).
+Step 3: If you must bluff, pick 1 expendable card from a rank you hold many of.
+Step 4: Set claimed_count equal to the number of cards you list.
+Respond with your JSON action.
+"""
+
+CHALLENGE_PROMPT_TEMPLATE = """
+═══ GAME STATE (Turn {turn_number}) ═══
+
+Required rank this turn: {current_rank}
+Rank cycle: {rank_cycle} (Ace→King round #{rank_cycle})
+
+My hand ({hand_size} cards): {hand_list}
+  → My {current_rank}s: {matching_count}
+
+Other players' hand sizes:
+{hand_sizes}
+
+Discard pile: {discard_pile_size} cards
+
+Caught-lie frequencies:
+{lie_frequencies}
+
+Recent history (last 8 turns):
+{claim_history}
+
+═══ CHALLENGE DECISION ═══
+Player {claimer_name} (ID={claimer_id}) just placed {actual_cards_placed} card(s) face-down and claimed {claimed_count}x {current_rank}.
+
+Key facts for your decision:
+  • {claimer_name}'s caught-lie frequency: {claimer_lie_freq:.2f}
+  • Total {current_rank}s claimed THIS rank cycle (including this play): {total_rank_claimed} / 8 max
+  • You hold {matching_count}x {current_rank} yourself — subtract from 8 to see how many could be held by others
+  • Discard pile if you lose the challenge: {discard_pile_size} cards added to your hand
+
+Decision framework:
+  1. If total_rank_claimed > 8 → someone is CERTAINLY lying. Challenge is safe.
+  2. If you hold many {current_rank}s yourself, fewer are left for others → claim less plausible.
+  3. If pile is large → losing the challenge is devastating. Be cautious.
+  4. Caught-lie frequency is a weak signal. Use it alongside other evidence, not alone.
+
+Respond with "challenge" or "pass_challenge" as your JSON action.
+"""
 
 
 # ---------------------------------------------------------------------------
-# LLMAgent
+# Helpers
 # ---------------------------------------------------------------------------
 
 def parse_model_spec(spec: str, default_provider: str) -> Tuple[str, str]:
@@ -149,6 +323,10 @@ def parse_model_spec(spec: str, default_provider: str) -> Tuple[str, str]:
         return c["provider"], c["model"]
     return default_provider, spec
 
+
+# ---------------------------------------------------------------------------
+# LLMAgent
+# ---------------------------------------------------------------------------
 
 class LLMAgent(BaseAgent):
     """LLM player with pluggable provider and prompt-mode ablation."""
@@ -173,7 +351,6 @@ class LLMAgent(BaseAgent):
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         prompt_mode: str = "cot",
-        memory_mode: str = "current_only",  # "current_only" | "full_history"
     ):
         super().__init__(player_id, name)
         if prompt_mode not in PROMPT_MODES:
@@ -185,59 +362,108 @@ class LLMAgent(BaseAgent):
         self.base_url = base_url
         self._api_key = api_key
         self.prompt_mode = prompt_mode
-        self.memory_mode = memory_mode
         self._system_prompt = _build_system_prompt(prompt_mode)
         self._openai_client: Optional[OpenAI] = None
 
-        # Runtime state
+        # Runtime state (reset each episode)
         self.reasoning_traces: List[dict] = []
         self.fallback_play_count: int = 0
-        self._history: List[str] = []    # accumulated turn summaries if full_history
         self._last_belief: Optional[dict] = None
+
+        # History tracking for prompt context
+        self._claim_history: List[dict] = []      # recent claims for prompt
+        self._lie_counts: Dict[int, int] = defaultdict(int)
+        self._turn_counts: Dict[int, int] = defaultdict(int)
+        self._rank_claimed_this_cycle: Dict[str, int] = defaultdict(int)
+        self._rank_cycle: int = 1
+        self._last_rank_seen: Optional[str] = None
+        self._agent_names: Dict[int, str] = {}    # populated from episode logger agents list
 
     def reset(self) -> None:
         self.reasoning_traces = []
         self.fallback_play_count = 0
-        self._history = []
         self._last_belief = None
+        self._claim_history = []
+        self._lie_counts = defaultdict(int)
+        self._turn_counts = defaultdict(int)
+        self._rank_claimed_this_cycle = defaultdict(int)
+        self._rank_cycle = 1
+        self._last_rank_seen = None
+        self._agent_names = {}
+
+    def set_agent_names(self, names: Dict[int, str]) -> None:
+        """Optional: call this before a game to give the agent opponent names."""
+        self._agent_names = names
 
     def observe_event(self, event: Dict[str, Any]) -> None:
-        if self.memory_mode != "full_history":
-            return
         atype = event.get("action", {}).get("type")
-        if atype == "play":
-            player = event["player"]
-            if player == self.player_id:
-                summary = (f"Turn {event['turn']}: I played {event['n_cards']}x "
-                           f"{event['claimed_rank']} ({'honest' if event.get('honest') else 'bluff'})")
-            else:
-                summary = (f"Turn {event['turn']}: P{player} claimed "
-                           f"{event['n_cards']}x {event['claimed_rank']}")
+
+        if atype == "play" and "claimed_rank" in event:
+            rank = event["claimed_rank"]
+            n    = event.get("n_cards", 1)
+            pid  = event["player"]
+
+            # Track rank cycle: new cycle when rank resets A after K
+            if self._last_rank_seen == "K" and rank == "A":
+                self._rank_cycle += 1
+                self._rank_claimed_this_cycle = defaultdict(int)
+            self._last_rank_seen = rank
+            self._rank_claimed_this_cycle[rank] += n
+            self._turn_counts[pid] += 1
+
+            self._claim_history.append({
+                "turn":         event.get("turn", 0),
+                "player":       pid,
+                "player_name":  self._agent_names.get(pid, f"P{pid}"),
+                "claimed_rank": rank,
+                "n_cards":      n,
+                "challenged":   False,
+                "result":       None,
+            })
+            # Keep last 20 entries
+            self._claim_history = self._claim_history[-20:]
+
         elif atype == "challenge":
-            result = event.get("challenge_result", "?")
-            summary = (f"Turn {event['turn']}: P{event['player']} challenged → "
-                       f"{result}, pile→P{event.get('pile_goes_to','?')}")
-        else:
-            return
-        self._history.append(summary)
+            result = event.get("challenge_result", "")
+            if result == "caught_bluffing":
+                caught_pid = event.get("pile_goes_to")
+                if caught_pid is not None:
+                    self._lie_counts[caught_pid] += 1
+            # Mark the last claim as challenged
+            if self._claim_history:
+                self._claim_history[-1]["challenged"] = True
+                self._claim_history[-1]["result"] = result
+            # Pile cleared — reset rank claims this cycle
+            self._rank_claimed_this_cycle = defaultdict(int)
 
     def report_belief(self, obs: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         return self._last_belief
 
+    # ------------------------------------------------------------------
+    # Main action method
+    # ------------------------------------------------------------------
+
     def choose_action(self, obs: Dict[str, Any]) -> Dict[str, Any]:
-        prompt = self._build_prompt(obs)
+        lc = obs.get("last_claim")
+        is_challenge_decision = (lc is not None and lc["player_id"] != self.player_id)
+
+        if is_challenge_decision:
+            prompt = self._build_challenge_prompt(obs)
+        else:
+            prompt = self._build_play_prompt(obs)
+
         response = self._call_llm(prompt)
 
         if response is None:
             self.fallback_play_count += 1
             return self._fallback_action(obs)
 
-        self._record_trace(obs, response)
+        self._record_trace(obs, response, "challenge" if is_challenge_decision else "play")
 
         try:
-            return self._parse_response(response, obs)
+            return self._parse_response(response, obs, is_challenge_decision)
         except Exception as e:
-            logger.warning("Failed to parse LLM response: %s — using fallback", e)
+            logger.warning("Failed to parse LLM response: %s — fallback", e)
             self.fallback_play_count += 1
             return self._fallback_action(obs)
 
@@ -245,76 +471,111 @@ class LLMAgent(BaseAgent):
     # Prompt building
     # ------------------------------------------------------------------
 
-    def _build_prompt(self, obs: Dict[str, Any]) -> str:
+    def _fmt_hand_sizes(self, obs: Dict[str, Any]) -> str:
+        sizes = obs.get("opponent_hand_sizes", {})
+        if not sizes:
+            return "  (no opponents)"
+        return "\n".join(
+            f"  Player {pid} ({self._agent_names.get(pid, f'P{pid}')}): {sz} cards"
+            for pid, sz in sorted(sizes.items())
+        )
+
+    def _fmt_lie_frequencies(self, obs: Dict[str, Any]) -> str:
+        sizes = obs.get("opponent_hand_sizes", {})
+        lines = []
+        for pid in sorted(sizes.keys()):
+            turns = max(self._turn_counts.get(pid, 1), 1)
+            freq  = self._lie_counts.get(pid, 0) / turns
+            name  = self._agent_names.get(pid, f"P{pid}")
+            lines.append(f"  Player {pid} ({name}): {freq:.2f}")
+        return "\n".join(lines) if lines else "  (no data yet)"
+
+    def _fmt_claim_history(self) -> str:
+        recent = self._claim_history[-8:]
+        if not recent:
+            return "  (no claims yet)"
+        lines = []
+        for r in recent:
+            name = r["player_name"]
+            ch = ""
+            if r["challenged"]:
+                ch = f" → CHALLENGED ({r['result']})"
+            lines.append(
+                f"  Turn {r['turn']}: {name} placed {r['n_cards']} card(s), "
+                f"claimed {r['n_cards']}x {r['claimed_rank']}{ch}"
+            )
+        return "\n".join(lines)
+
+    def _build_play_prompt(self, obs: Dict[str, Any]) -> str:
         rank = obs["current_rank"]
         hand: List[Card] = obs["my_hand"]
-        opp_sizes: Dict[int, int] = obs.get("opponent_hand_sizes", {})
-        lc = obs.get("last_claim")
-
-        matching = [c for c in hand if c.rank == rank]
-        jokers = [c for c in hand if c.rank == JOKER_RANK]
-        hand_str = ", ".join(str(c) for c in hand) if hand else "(empty)"
-        opp_str = "  ".join(f"P{pid}:{sz}" for pid, sz in sorted(opp_sizes.items()))
-
-        if lc and lc["player_id"] != self.player_id:
-            last_claim_section = (
-                f"Last claim: P{lc['player_id']} played {lc['n_cards']} card(s) "
-                f"claiming {lc['n_cards']}x {lc['claimed_rank']}"
-            )
-            decision_prompt = _CHALLENGE_DECISION.format(
-                claimer_id=lc["player_id"],
-                n_cards=lc["n_cards"],
-                claimed_rank=lc["claimed_rank"],
-            )
-        else:
-            last_claim_section = "Last claim: None (game start or post-challenge)"
-            decision_prompt = _PLAY_DECISION
-
-        history_section = ""
-        if self.memory_mode == "full_history" and self._history:
-            recent = self._history[-8:]
-            history_section = "\nRecent history:\n" + "\n".join(f"  {h}" for h in recent) + "\n"
-
-        return history_section + _USER_PROMPT_TEMPLATE.format(
-            turn=obs["turn"],
+        matching = sum(1 for c in hand if c.rank == rank or c.rank == JOKER_RANK)
+        return PLAY_PROMPT_TEMPLATE.format(
+            turn_number=obs["turn"],
             current_rank=rank,
-            my_hand_size=obs["my_hand_size"],
-            hand_str=hand_str,
-            matching_count=len(matching),
-            joker_count=len(jokers),
-            opp_sizes_str=opp_str or "N/A",
-            pile_size=obs["pile_size"],
-            last_claim_section=last_claim_section,
-            decision_prompt=decision_prompt,
+            rank_cycle=self._rank_cycle,
+            hand_size=obs["my_hand_size"],
+            hand_list=", ".join(str(c) for c in hand) or "(empty)",
+            matching_count=matching,
+            hand_sizes=self._fmt_hand_sizes(obs),
+            discard_pile_size=obs["pile_size"],
+            lie_frequencies=self._fmt_lie_frequencies(obs),
+            claim_history=self._fmt_claim_history(),
+        )
+
+    def _build_challenge_prompt(self, obs: Dict[str, Any]) -> str:
+        rank = obs["current_rank"]
+        hand: List[Card] = obs["my_hand"]
+        lc = obs["last_claim"]
+        matching = sum(1 for c in hand if c.rank == rank or c.rank == JOKER_RANK)
+        claimer_id = lc["player_id"]
+        claimer_name = self._agent_names.get(claimer_id, f"P{claimer_id}")
+        claimer_turns = max(self._turn_counts.get(claimer_id, 1), 1)
+        claimer_lie_freq = self._lie_counts.get(claimer_id, 0) / claimer_turns
+        total_rank_claimed = self._rank_claimed_this_cycle.get(rank, 0) + lc["n_cards"]
+
+        return CHALLENGE_PROMPT_TEMPLATE.format(
+            turn_number=obs["turn"],
+            current_rank=rank,
+            rank_cycle=self._rank_cycle,
+            hand_size=obs["my_hand_size"],
+            hand_list=", ".join(str(c) for c in hand) or "(empty)",
+            matching_count=matching,
+            hand_sizes=self._fmt_hand_sizes(obs),
+            discard_pile_size=obs["pile_size"],
+            lie_frequencies=self._fmt_lie_frequencies(obs),
+            claim_history=self._fmt_claim_history(),
+            claimer_name=claimer_name,
+            claimer_id=claimer_id,
+            actual_cards_placed=lc["n_cards"],
+            claimed_count=lc["n_cards"],
+            claimer_lie_freq=claimer_lie_freq,
+            total_rank_claimed=total_rank_claimed,
         )
 
     # ------------------------------------------------------------------
     # Response parsing
     # ------------------------------------------------------------------
 
-    def _parse_response(self, response: dict, obs: Dict[str, Any]) -> Dict[str, Any]:
+    def _parse_response(
+        self, response: dict, obs: Dict[str, Any], is_challenge_decision: bool
+    ) -> Dict[str, Any]:
         action = response.get("action", "play")
         self._last_belief = {"reasoning": response.get("reasoning", "")}
 
-        if action == "challenge":
-            lc = obs.get("last_claim")
-            if lc and lc["player_id"] != self.player_id:
-                return {"type": "challenge"}
-            # Can't challenge — fall through to play
-            logger.warning("LLM wanted to challenge but no valid last_claim — playing instead")
+        if is_challenge_decision:
+            if action == "challenge":
+                lc = obs.get("last_claim")
+                if lc and lc["player_id"] != self.player_id:
+                    return {"type": "challenge"}
+            # pass_challenge or anything else → return play action (treated as "no challenge" by runner)
+            return self._fallback_action(obs)
 
-        # Parse play
+        # Play decision
         rank = obs["current_rank"]
         hand: List[Card] = obs["my_hand"]
         card_strings: List[str] = response.get("cards", [])
-        claimed_rank: str = response.get("claimed_rank", rank)
 
-        # Enforce claimed_rank == current_rank (engine rule)
-        if claimed_rank != rank:
-            logger.warning("LLM claimed rank %r but current rank is %r — correcting", claimed_rank, rank)
-            claimed_rank = rank
-
-        # Resolve card strings to actual Card objects in hand
         hand_lookup: Dict[str, List[Card]] = defaultdict(list)
         for c in hand:
             hand_lookup[str(c)].append(c)
@@ -328,7 +589,7 @@ class LLMAgent(BaseAgent):
             self.fallback_play_count += 1
             return self._fallback_action(obs)
 
-        return {"type": "play", "cards": parsed, "claimed_rank": claimed_rank}
+        return {"type": "play", "cards": parsed, "claimed_rank": rank}
 
     def _fallback_action(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         rank = obs["current_rank"]
@@ -343,19 +604,19 @@ class LLMAgent(BaseAgent):
             return {"type": "play", "cards": [jokers[0]], "claimed_rank": rank}
         return {"type": "play", "cards": [hand[0]], "claimed_rank": rank}
 
-    def _record_trace(self, obs: Dict[str, Any], response: dict) -> None:
+    def _record_trace(self, obs: Dict[str, Any], response: dict, phase: str) -> None:
         self.reasoning_traces.append({
-            "turn": obs["turn"],
-            "player_id": self.player_id,
-            "prompt_mode": self.prompt_mode,
+            "turn":         obs["turn"],
+            "player_id":    self.player_id,
+            "phase":        phase,
+            "prompt_mode":  self.prompt_mode,
+            "rank_cycle":   self._rank_cycle,
             "current_rank": obs["current_rank"],
-            "hand_size": obs["my_hand_size"],
-            "pile_size": obs["pile_size"],
-            "had_last_claim": obs.get("last_claim") is not None,
-            "reasoning": response.get("reasoning", ""),
-            "action": response.get("action"),
-            "cards": response.get("cards", []),
-            "claimed_rank": response.get("claimed_rank"),
+            "hand_size":    obs["my_hand_size"],
+            "pile_size":    obs["pile_size"],
+            "reasoning":    response.get("reasoning", ""),
+            "action":       response.get("action"),
+            "cards":        response.get("cards", []),
         })
 
     # ------------------------------------------------------------------
