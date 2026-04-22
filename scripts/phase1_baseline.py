@@ -104,6 +104,12 @@ def run_episode(agents, seed: int, verbose: bool = False) -> EpisodeLogger:
         if action.get("type") == "challenge":
             logger.debug("Agent %s tried to challenge on their play turn — overriding", agent.name)
             action = {"type": "play", "cards": [obs["my_hand"][0]], "claimed_rank": obs["current_rank"]}
+        # Guard: must play 1–4 valid cards
+        if action.get("type") == "play" and not (1 <= len(action.get("cards", [])) <= 4):
+            logger.warning("Agent %s returned invalid card count (%s) — using fallback",
+                           agent.name, len(action.get("cards", [])))
+            hand = obs["my_hand"]
+            action = {"type": "play", "cards": [hand[0]], "claimed_rank": obs["current_rank"]}
 
         new_state, play_event = apply_action(state, action)
         belief = agent.report_belief(obs)

@@ -595,7 +595,8 @@ class LLMAgent(BaseAgent):
         rank = obs["current_rank"]
         hand: List[Card] = obs["my_hand"]
         if not hand:
-            return {"type": "play", "cards": [], "claimed_rank": rank}
+            # Hand is empty — game should have ended; raise so the runner can handle it
+            raise ValueError("_fallback_action called with empty hand (game logic error)")
         matching = [c for c in hand if c.rank == rank]
         if matching:
             return {"type": "play", "cards": [matching[0]], "claimed_rank": rank}
