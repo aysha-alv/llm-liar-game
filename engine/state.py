@@ -7,7 +7,7 @@ instead of a single opponent_hand_size int.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
-from .card import Card, RANKS, JOKER_RANK
+from .card import Card, RANKS
 
 
 @dataclass
@@ -20,7 +20,7 @@ class Claim:
 
     @property
     def is_honest(self) -> bool:
-        return all(c.rank == self.claimed_rank or c.rank == JOKER_RANK for c in self.actual_cards)
+        return all(c.rank == self.claimed_rank for c in self.actual_cards)
 
 
 @dataclass

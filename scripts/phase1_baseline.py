@@ -37,6 +37,8 @@ from agents import (
 from evaluation.metrics import InformationTheoreticMetrics
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 MAX_TURNS = 600
@@ -268,6 +270,8 @@ def run_tournament(
             agent_stats[aname]["games"] += 1
         winner_name = agents_list[winner_id].name.split("_")[0]
         agent_stats[winner_name]["wins"] += 1
+        logger.info("Game %s/%s done — winner: %s, turns: %s",
+                    game_num + 1, num_games, agents_list[winner_id].name, log["outcome"]["total_turns"])
 
         # Per-game IT metrics for LLM
         it = it_metrics.analyze_episode(log, llm_id)

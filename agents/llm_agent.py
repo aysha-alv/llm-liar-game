@@ -5,7 +5,7 @@ Implements the new engine interface: choose_action(obs) -> action dict.
 Supports OpenAI-compatible APIs (OpenAI, xAI/Grok, Ollama), Anthropic, and Google Gemini.
 
 Uses structured SYSTEM_PROMPT + PLAY_PROMPT_TEMPLATE + CHALLENGE_PROMPT_TEMPLATE.
-Deck is 108 cards (2 standard decks + 4 Jokers): max 8 honest cards per rank per cycle.
+Deck is 104 cards (2 standard decks, no Jokers): max 8 honest cards per rank per cycle.
 
 Prompt modes (all use the same structured templates — mode controls the SYSTEM_PROMPT):
   zero_shot  — rules only, no strategic guidance
@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from openai import OpenAI
 
 from .base import BaseAgent
-from engine.card import Card, JOKER_RANK, RANKS
+from engine.card import Card, RANKS
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,7 @@ MODEL_CONFIGS: Dict[str, Dict[str, str]] = {
     "gpt-4o":            {"provider": "openai",    "model": "gpt-4o"},
     "gpt-4o-mini":       {"provider": "openai",    "model": "gpt-4o-mini"},
     "claude-sonnet-4-5": {"provider": "anthropic", "model": "claude-sonnet-4-5"},
+    "claude-haiku-4-5":  {"provider": "anthropic", "model": "claude-haiku-4-5"},
     "gemini-2.0-flash":  {"provider": "google",    "model": "gemini-2.0-flash"},
 }
 
@@ -46,28 +47,29 @@ MODEL_CONFIGS: Dict[str, Dict[str, str]] = {
 # ---------------------------------------------------------------------------
 
 _SYSTEM_ZERO_SHOT = """You are an expert player of the card game Liar (also called Cheat or Bullshit).
-A 108-card deck (two standard decks + 4 Jokers) is dealt among all players. Your goal: be the FIRST to empty your hand.
+A 104-card deck (two standard 52-card decks, no Jokers) is dealt among all players. Your goal: be the FIRST to empty your hand.
 
 ═══ RULES ═══
 
 1. TURNS: On your turn you MUST place 1–4 cards face-down and CLAIM they are the current required rank.
 2. VISIBILITY: All players see HOW MANY cards you placed. Nobody sees the faces until a challenge.
 3. LYING: You may lie about the rank of the cards you play. Your claimed_count must equal the number of cards you actually place.
-4. RANK CYCLE: The required rank advances each turn: Ace → Two → Three → … → King → Ace → Two → …
-   Each full Ace-through-King pass is one "rank cycle."
+4. RANK CYCLE: The required rank advances each turn: A → 2 → 3 → … → K → A → 2 → …
+   Each full A-through-K pass is one "rank cycle."
 5. CHALLENGES: After any play, any OTHER player may call "Bullshit":
    • If the player LIED (wrong rank) → the liar picks up the ENTIRE discard pile.
    • If the player was HONEST → the challenger picks up the ENTIRE discard pile.
    After a challenge the rank still advances and play continues.
-6. EIGHT-CARD RULE: Two decks means 8 cards of each rank exist.
+6. EIGHT-CARD RULE: Two decks means 8 cards of each rank exist (4 suits × 2 decks).
    Within a SINGLE rank cycle, at most 8 of any rank can truthfully be played.
    If total claims for a rank EXCEED 8 within the same cycle, someone MUST be lying.
-   (Jokers count as wildcards and are always honest.)
 
 ═══ CARD FORMAT ═══
 
 Cards are written as RankSuit with Unicode suit symbols.
-Examples: Ace♥  Two♦  Ten♣  King♠  Queen♥  Jack♦  Three♠  Seven♣  Joker★
+Ranks: A, 2, 3, 4, 5, 6, 7, 8, 9, 10, J, Q, K
+Suits: ♠ ♥ ♦ ♣
+Examples: A♥  2♦  10♣  K♠  Q♥  J♦  3♠  7♣
 ONLY use cards that appear in "My hand" below. Do NOT invent cards.
 
 ═══ OUTPUT FORMAT ═══
@@ -77,7 +79,7 @@ Respond with ONLY a single JSON object. No markdown, no commentary, no extra tex
 When it is YOUR TURN TO PLAY:
 {
   "action": "play",
-  "cards": ["Ace♥", "Ace♣"],
+  "cards": ["A♥", "A♣"],
   "claimed_count": 2,
   "reasoning": "I have 2 Aces, so I play them both honestly."
 }
@@ -90,39 +92,40 @@ RULES for the play action:
 When you are DECIDING WHETHER TO CHALLENGE another player's play:
 {
   "action": "challenge",
-  "reasoning": "Total Aces claimed this cycle is 9, exceeding the 8-card maximum."
+  "reasoning": "Total As claimed this cycle is 9, exceeding the 8-card maximum."
 }
 or
 {
   "action": "pass_challenge",
-  "reasoning": "Only 2 Aces claimed so far, plausible. Pile is large, too risky."
+  "reasoning": "Only 2 As claimed so far, plausible. Pile is large, too risky."
 }
 
 IMPORTANT: Output ONLY the JSON object. No other text before or after."""
 
 _SYSTEM_COT = """You are an expert player of the card game Liar (also called Cheat or Bullshit).
-A 108-card deck (two standard decks + 4 Jokers) is dealt among all players. Your goal: be the FIRST to empty your hand.
+A 104-card deck (two standard 52-card decks, no Jokers) is dealt among all players. Your goal: be the FIRST to empty your hand.
 
 ═══ RULES ═══
 
 1. TURNS: On your turn you MUST place 1–4 cards face-down and CLAIM they are the current required rank.
 2. VISIBILITY: All players see HOW MANY cards you placed. Nobody sees the faces until a challenge.
 3. LYING: You may lie about the rank of the cards you play. Your claimed_count must equal the number of cards you actually place.
-4. RANK CYCLE: The required rank advances each turn: Ace → Two → Three → … → King → Ace → Two → …
-   Each full Ace-through-King pass is one "rank cycle."
+4. RANK CYCLE: The required rank advances each turn: A → 2 → 3 → … → K → A → 2 → …
+   Each full A-through-K pass is one "rank cycle."
 5. CHALLENGES: After any play, any OTHER player may call "Bullshit":
    • If the player LIED (wrong rank) → the liar picks up the ENTIRE discard pile.
    • If the player was HONEST → the challenger picks up the ENTIRE discard pile.
    After a challenge the rank still advances and play continues.
-6. EIGHT-CARD RULE: Two decks means 8 cards of each rank exist.
+6. EIGHT-CARD RULE: Two decks means 8 cards of each rank exist (4 suits × 2 decks).
    Within a SINGLE rank cycle, at most 8 of any rank can truthfully be played.
    If total claims for a rank EXCEED 8 within the same cycle, someone MUST be lying.
-   (Jokers count as wildcards and are always honest.)
 
 ═══ CARD FORMAT ═══
 
 Cards are written as RankSuit with Unicode suit symbols.
-Examples: Ace♥  Two♦  Ten♣  King♠  Queen♥  Jack♦  Three♠  Seven♣  Joker★
+Ranks: A, 2, 3, 4, 5, 6, 7, 8, 9, 10, J, Q, K
+Suits: ♠ ♥ ♦ ♣
+Examples: A♥  2♦  10♣  K♠  Q♥  J♦  3♠  7♣
 ONLY use cards that appear in "My hand" below. Do NOT invent cards.
 
 ═══ STRATEGY GUIDELINES ═══
@@ -142,7 +145,7 @@ Respond with ONLY a single JSON object. No markdown, no commentary, no extra tex
 When it is YOUR TURN TO PLAY:
 {
   "action": "play",
-  "cards": ["Ace♥", "Ace♣"],
+  "cards": ["A♥", "A♣"],
   "claimed_count": 2,
   "reasoning": "I have 2 Aces, so I play them both honestly."
 }
@@ -155,39 +158,40 @@ RULES for the play action:
 When you are DECIDING WHETHER TO CHALLENGE another player's play:
 {
   "action": "challenge",
-  "reasoning": "Total Aces claimed this cycle is 9, exceeding the 8-card maximum."
+  "reasoning": "Total As claimed this cycle is 9, exceeding the 8-card maximum."
 }
 or
 {
   "action": "pass_challenge",
-  "reasoning": "Only 2 Aces claimed so far, plausible. Pile is large, too risky."
+  "reasoning": "Only 2 As claimed so far, plausible. Pile is large, too risky."
 }
 
 IMPORTANT: Output ONLY the JSON object. No other text before or after."""
 
 _SYSTEM_FEW_SHOT = """You are an expert player of the card game Liar (also called Cheat or Bullshit).
-A 108-card deck (two standard decks + 4 Jokers) is dealt among all players. Your goal: be the FIRST to empty your hand.
+A 104-card deck (two standard 52-card decks, no Jokers) is dealt among all players. Your goal: be the FIRST to empty your hand.
 
 ═══ RULES ═══
 
 1. TURNS: On your turn you MUST place 1–4 cards face-down and CLAIM they are the current required rank.
 2. VISIBILITY: All players see HOW MANY cards you placed. Nobody sees the faces until a challenge.
 3. LYING: You may lie about the rank of the cards you play. Your claimed_count must equal the number of cards you actually place.
-4. RANK CYCLE: The required rank advances each turn: Ace → Two → Three → … → King → Ace → Two → …
-   Each full Ace-through-King pass is one "rank cycle."
+4. RANK CYCLE: The required rank advances each turn: A → 2 → 3 → … → K → A → 2 → …
+   Each full A-through-K pass is one "rank cycle."
 5. CHALLENGES: After any play, any OTHER player may call "Bullshit":
    • If the player LIED (wrong rank) → the liar picks up the ENTIRE discard pile.
    • If the player was HONEST → the challenger picks up the ENTIRE discard pile.
    After a challenge the rank still advances and play continues.
-6. EIGHT-CARD RULE: Two decks means 8 cards of each rank exist.
+6. EIGHT-CARD RULE: Two decks means 8 cards of each rank exist (4 suits × 2 decks).
    Within a SINGLE rank cycle, at most 8 of any rank can truthfully be played.
    If total claims for a rank EXCEED 8 within the same cycle, someone MUST be lying.
-   (Jokers count as wildcards and are always honest.)
 
 ═══ CARD FORMAT ═══
 
 Cards are written as RankSuit with Unicode suit symbols.
-Examples: Ace♥  Two♦  Ten♣  King♠  Queen♥  Jack♦  Three♠  Seven♣  Joker★
+Ranks: A, 2, 3, 4, 5, 6, 7, 8, 9, 10, J, Q, K
+Suits: ♠ ♥ ♦ ♣
+Examples: A♥  2♦  10♣  K♠  Q♥  J♦  3♠  7♣
 ONLY use cards that appear in "My hand" below. Do NOT invent cards.
 
 ═══ STRATEGY GUIDELINES ═══
@@ -202,27 +206,27 @@ ONLY use cards that appear in "My hand" below. Do NOT invent cards.
 ═══ EXAMPLES ═══
 
 Example 1 — Honest play (have matching cards):
-Rank=King. My hand has King♠, King♥, Three♦. → Play both Kings honestly.
-{"action": "play", "cards": ["King♠","King♥"], "claimed_count": 2, "reasoning": "Have 2 Kings — play honestly, risk-free."}
+Rank=K. My hand has K♠, K♥, 3♦. → Play both Kings honestly.
+{"action": "play", "cards": ["K♠","K♥"], "claimed_count": 2, "reasoning": "Have 2 Ks — play honestly, risk-free."}
 
 Example 2 — Minimal bluff (no matching cards):
-Rank=Seven. My hand has no Sevens. 18 cards in hand. → Bluff 1 expendable card.
-{"action": "play", "cards": ["Two♣"], "claimed_count": 1, "reasoning": "No Sevens. Play 1 expendable card, claim 1 to minimise suspicion."}
+Rank=7. My hand has no 7s. 18 cards in hand. → Bluff 1 expendable card.
+{"action": "play", "cards": ["2♣"], "claimed_count": 1, "reasoning": "No 7s. Play 1 expendable card, claim 1 to minimise suspicion."}
 
 Example 3 — Pass challenge (pile too large to risk):
-Last claim: 2 Aces, pile=14 cards. Opponent lie freq=0.10. My hand=8 cards.
+Last claim: 2 As, pile=14 cards. Opponent lie freq=0.10. My hand=8 cards.
 {"action": "pass_challenge", "reasoning": "Losing adds 14 cards. Low observed lie rate. Not worth the risk."}
 
 Example 4 — Challenge (mathematically certain):
-Total Aces claimed this cycle: 9 (exceeds 8 max for 2 decks). Pile=4.
-{"action": "challenge", "reasoning": "9 Aces claimed this cycle but only 8 exist. Certain lie."}
+Total As claimed this cycle: 9 (exceeds 8 max for 2 decks). Pile=4.
+{"action": "challenge", "reasoning": "9 As claimed this cycle but only 8 exist. Certain lie."}
 
 ═══ OUTPUT FORMAT ═══
 
 Respond with ONLY a single JSON object. No markdown, no commentary, no extra text.
 
 When it is YOUR TURN TO PLAY:
-{"action": "play", "cards": ["Ace♥","Ace♣"], "claimed_count": 2, "reasoning": "..."}
+{"action": "play", "cards": ["A♥","A♣"], "claimed_count": 2, "reasoning": "..."}
 
 When deciding whether to CHALLENGE:
 {"action": "challenge", "reasoning": "..."} or {"action": "pass_challenge", "reasoning": "..."}
@@ -239,14 +243,14 @@ def _build_system_prompt(mode: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Prompt templates (adapted from prompt_1.md for 108-card deck)
+# Prompt templates (adapted from prompt_1.md for 104-card deck)
 # ---------------------------------------------------------------------------
 
 PLAY_PROMPT_TEMPLATE = """
 ═══ GAME STATE (Turn {turn_number}) ═══
 
 Required rank this turn: {current_rank}
-Rank cycle: {rank_cycle} (Ace→King round #{rank_cycle})
+Rank cycle: {rank_cycle} (A→K round #{rank_cycle})
 
 My hand ({hand_size} cards): {hand_list}
   → Matching cards ({current_rank}): {matching_count}
@@ -274,7 +278,7 @@ CHALLENGE_PROMPT_TEMPLATE = """
 ═══ GAME STATE (Turn {turn_number}) ═══
 
 Required rank this turn: {current_rank}
-Rank cycle: {rank_cycle} (Ace→King round #{rank_cycle})
+Rank cycle: {rank_cycle} (A→K round #{rank_cycle})
 
 My hand ({hand_size} cards): {hand_list}
   → My {current_rank}s: {matching_count}
@@ -509,7 +513,7 @@ class LLMAgent(BaseAgent):
     def _build_play_prompt(self, obs: Dict[str, Any]) -> str:
         rank = obs["current_rank"]
         hand: List[Card] = obs["my_hand"]
-        matching = sum(1 for c in hand if c.rank == rank or c.rank == JOKER_RANK)
+        matching = sum(1 for c in hand if c.rank == rank)
         return PLAY_PROMPT_TEMPLATE.format(
             turn_number=obs["turn"],
             current_rank=rank,
@@ -527,7 +531,7 @@ class LLMAgent(BaseAgent):
         rank = obs["current_rank"]
         hand: List[Card] = obs["my_hand"]
         lc = obs["last_claim"]
-        matching = sum(1 for c in hand if c.rank == rank or c.rank == JOKER_RANK)
+        matching = sum(1 for c in hand if c.rank == rank)
         claimer_id = lc["player_id"]
         claimer_name = self._agent_names.get(claimer_id, f"P{claimer_id}")
         claimer_turns = max(self._turn_counts.get(claimer_id, 1), 1)
@@ -600,9 +604,6 @@ class LLMAgent(BaseAgent):
         matching = [c for c in hand if c.rank == rank]
         if matching:
             return {"type": "play", "cards": [matching[0]], "claimed_rank": rank}
-        jokers = [c for c in hand if c.rank == JOKER_RANK]
-        if jokers:
-            return {"type": "play", "cards": [jokers[0]], "claimed_rank": rank}
         return {"type": "play", "cards": [hand[0]], "claimed_rank": rank}
 
     def _record_trace(self, obs: Dict[str, Any], response: dict, phase: str) -> None:

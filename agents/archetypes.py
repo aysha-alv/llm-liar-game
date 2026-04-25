@@ -6,8 +6,8 @@ Each archetype implements BaseAgent (from agents/base.py):
                      or {"type": "challenge"}
   observe_event(event) — accumulates public history for stateful agents
 
-Deck is 108 cards (2 standard decks + 4 Jokers), so max honest cards per rank
-per cycle is 8 (plus Jokers as wildcards). Challenge impossibility threshold: >8.
+Deck is 104 cards (2 standard decks, no Jokers), so max honest cards per rank
+per cycle is 8. Challenge impossibility threshold: >8.
 
 Archetypes (paper-reported win rates in 6-player 52-card games, for reference):
   TheSaint        51%   Never lies unless forced; challenges only when impossible
@@ -22,7 +22,7 @@ import random
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
-from engine.card import Card, JOKER_RANK, RANK_INDEX
+from engine.card import Card, RANK_INDEX
 from .base import BaseAgent
 
 
@@ -30,12 +30,11 @@ from .base import BaseAgent
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-def _partition(hand: List[Card], rank: str) -> Tuple[List[Card], List[Card], List[Card]]:
-    """Split hand into (real_matching, jokers, off_rank)."""
+def _partition(hand: List[Card], rank: str) -> Tuple[List[Card], List[Card]]:
+    """Split hand into (real_matching, off_rank)."""
     real   = [c for c in hand if c.rank == rank]
-    jokers = [c for c in hand if c.rank == JOKER_RANK]
-    off    = [c for c in hand if c.rank != rank and c.rank != JOKER_RANK]
-    return real, jokers, off
+    off    = [c for c in hand if c.rank != rank]
+    return real, off
 
 
 def _worst_cards(hand: List[Card], rank: str, n: int) -> List[Card]:
@@ -43,7 +42,7 @@ def _worst_cards(hand: List[Card], rank: str, n: int) -> List[Card]:
     Pick n cards to bluff with — prefer ranks furthest from current rank
     (least useful in upcoming turns).
     """
-    off = [c for c in hand if c.rank != rank and c.rank != JOKER_RANK]
+    off = [c for c in hand if c.rank != rank]
     if not off:
         return hand[:n]
     off.sort(key=lambda c: min(
@@ -67,7 +66,7 @@ class TheSaint(BaseAgent):
     """
     Plays honestly whenever possible.
     Challenges only when the total claimed for this rank this cycle exceeds
-    8 (impossible with 2 decks, ignoring Jokers).
+    8 (impossible with 2 decks).
     """
 
     MAX_HONEST_PER_RANK = 8  # 2 decks × 4 suits
@@ -101,11 +100,9 @@ class TheSaint(BaseAgent):
                 return {"type": "challenge"}
 
         # Play decision
-        real, jokers, off = _partition(hand, rank)
+        real, off = _partition(hand, rank)
         if real:
             return {"type": "play", "cards": real[:4], "claimed_rank": rank}
-        if jokers:
-            return {"type": "play", "cards": [jokers[0]], "claimed_rank": rank}
         # Forced bluff — play 1 worst card
         worst = _worst_cards(hand, rank, 1)
         return {"type": "play", "cards": worst, "claimed_rank": rank}
@@ -142,7 +139,7 @@ class ComebackCloser(BaseAgent):
         # Play decision
         avg_opp = sum(opp_sizes.values()) / max(len(opp_sizes), 1) if opp_sizes else 0
         is_losing = len(hand) > avg_opp
-        real, jokers, off = _partition(hand, rank)
+        real, off = _partition(hand, rank)
 
         if real and not is_losing:
             return {"type": "play", "cards": real[:4], "claimed_rank": rank}
@@ -213,11 +210,9 @@ class GameTheorist(BaseAgent):
             if eig > 0:
                 return {"type": "challenge"}
 
-        real, jokers, off = _partition(hand, rank)
+        real, off = _partition(hand, rank)
         if real:
             return {"type": "play", "cards": real[:4], "claimed_rank": rank}
-        if jokers:
-            return {"type": "play", "cards": [jokers[0]], "claimed_rank": rank}
         worst = _worst_cards(hand, rank, 1)
         return {"type": "play", "cards": worst, "claimed_rank": rank}
 
@@ -239,11 +234,11 @@ class MrPathological(BaseAgent):
         if _is_opponents_claim(obs, self.player_id) and random.random() < 0.5:
             return {"type": "challenge"}
 
-        _, _, off = _partition(hand, rank)
+        _, off = _partition(hand, rank)
         if off:
             n = random.randint(1, min(3, len(off)))
             return {"type": "play", "cards": off[:n], "claimed_rank": rank}
-        # Only matching/joker cards left — play them but overclaim
+        # Only matching cards left — play them but overclaim
         n = random.randint(1, min(2, len(hand)))
         return {"type": "play", "cards": hand[:n], "claimed_rank": rank}
 
@@ -297,11 +292,9 @@ class TheAccountant(BaseAgent):
             if random.random() < prob:
                 return {"type": "challenge"}
 
-        real, jokers, off = _partition(hand, rank)
+        real, off = _partition(hand, rank)
         if real:
             return {"type": "play", "cards": real[:4], "claimed_rank": rank}
-        if jokers:
-            return {"type": "play", "cards": [jokers[0]], "claimed_rank": rank}
         worst = _worst_cards(hand, rank, 1)
         return {"type": "play", "cards": worst, "claimed_rank": rank}
 
@@ -331,10 +324,8 @@ class TheCollector(BaseAgent):
             if obs["pile_size"] > 8 and random.random() < 0.3:
                 return {"type": "challenge"}
 
-        real, jokers, off = _partition(hand, rank)
+        real, off = _partition(hand, rank)
         if real:
             return {"type": "play", "cards": real[:4], "claimed_rank": rank}
-        if jokers:
-            return {"type": "play", "cards": [jokers[0]], "claimed_rank": rank}
         worst = _worst_cards(hand, rank, 1)
         return {"type": "play", "cards": worst, "claimed_rank": rank}

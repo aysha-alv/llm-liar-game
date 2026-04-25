@@ -25,10 +25,9 @@ class Card:
 
 
 def full_deck() -> List[Card]:
-    """Two standard 52-card decks plus 4 Jokers = 108 cards."""
+    """Two standard 52-card decks = 104 cards (no Jokers)."""
     standard = [Card(r, s) for r in RANKS for s in SUITS]
-    jokers = [Card(JOKER_RANK, JOKER_SUIT)] * 4
-    return standard * 2 + jokers
+    return standard * 2
 
 
 def deal(deck: List[Card], n_players: int) -> List[List[Card]]:
