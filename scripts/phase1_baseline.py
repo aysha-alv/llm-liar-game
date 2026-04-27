@@ -33,6 +33,7 @@ from agents import (
     LLMAgent, MODEL_CONFIGS, PROMPT_MODES, parse_model_spec,
     TheSaint, ComebackCloser, GameTheorist,
     MrPathological, TheAccountant, TheCollector,
+    BalancedPlayer,
 )
 from evaluation.metrics import InformationTheoreticMetrics
 
@@ -52,12 +53,39 @@ ARCHETYPES = [
     ("TheCollector",   TheCollector),
 ]
 
+# Controlled pool: excludes TheSaint (48% WR) and GameTheorist (45% WR) — the two
+# dominant agents whose presence suppresses every other player's win rate well below
+# the 25% random baseline in a 4-player game. Used for the "Option A" controlled runs.
+CONTROLLED_ARCHETYPES = [
+    ("ComebackCloser", ComebackCloser),
+    ("MrPathological", MrPathological),
+    ("TheAccountant",  TheAccountant),
+    ("TheCollector",   TheCollector),
+]
+
+# Symmetric pool: exactly 3 BalancedPlayer clones every game.
+# Symmetry guarantees each clone wins 25% in expectation — any LLM deviation
+# from 25% is a pure skill signal with no opponent-composition confound.
+# Calibration (scripts/calibrate_balanced.py) verifies implementation symmetry
+# before running LLM games.
+SYMMETRIC_ARCHETYPES = [
+    ("BalancedPlayer", BalancedPlayer),
+    ("BalancedPlayer", BalancedPlayer),
+    ("BalancedPlayer", BalancedPlayer),
+]
+
+OPPONENT_POOLS = {
+    "full":       ARCHETYPES,
+    "controlled": CONTROLLED_ARCHETYPES,
+    "symmetric":  SYMMETRIC_ARCHETYPES,
+}
+
 
 # ---------------------------------------------------------------------------
 # N-player episode runner
 # ---------------------------------------------------------------------------
 
-def run_episode(agents, seed: int, verbose: bool = False) -> EpisodeLogger:
+def run_episode(agents, seed: int, verbose: bool = False, max_turns: int = MAX_TURNS) -> EpisodeLogger:
     """
     Run one game with N agents.
 
@@ -95,7 +123,7 @@ def run_episode(agents, seed: int, verbose: bool = False) -> EpisodeLogger:
             "n_cards":      event.get("n_cards"),
         }
 
-    while not state.is_terminal and state.turn < MAX_TURNS:
+    while not state.is_terminal and state.turn < max_turns:
         player = state.current_player
         agent  = agents[player]
         obs    = state.public_observation(player)
@@ -211,6 +239,8 @@ def run_tournament(
     base_url: str | None = None,
     api_key: str | None = None,
     prompt_mode: str = "cot",
+    max_turns: int = MAX_TURNS,
+    opponent_pool: str = "full",
 ) -> dict:
     if output_dir is None:
         output_dir = Path(__file__).parent.parent / "data" / "results"
@@ -218,12 +248,25 @@ def run_tournament(
     traces_dir = Path(__file__).parent.parent / "data" / "traces"
     traces_dir.mkdir(parents=True, exist_ok=True)
 
+    if opponent_pool not in OPPONENT_POOLS:
+        raise ValueError(f"opponent_pool must be one of {list(OPPONENT_POOLS)}, got {opponent_pool!r}")
+    archetype_pool = OPPONENT_POOLS[opponent_pool]
+
+    # Sanity check: need at least num_players-1 archetypes to fill the table
+    n_opponents_needed = num_players - 1
+    if len(archetype_pool) < n_opponents_needed:
+        raise ValueError(
+            f"opponent_pool={opponent_pool!r} has only {len(archetype_pool)} archetypes "
+            f"but {n_opponents_needed} opponents are needed for a {num_players}-player game. "
+            f"Lower --players or choose a larger pool."
+        )
+
     it_metrics = InformationTheoreticMetrics()
     agent_stats: dict = defaultdict(lambda: defaultdict(int))
     all_game_summaries = []
 
-    logger.info("Phase 1: %s games, %s players, model=%s/%s, prompt_mode=%s",
-                num_games, num_players, llm_provider, llm_model, prompt_mode)
+    logger.info("Phase 1: %s games, %s players, model=%s/%s, prompt_mode=%s, opponent_pool=%s",
+                num_games, num_players, llm_provider, llm_model, prompt_mode, opponent_pool)
 
     try:
         llm = LLMAgent(
@@ -243,9 +286,9 @@ def run_tournament(
         seed = random.randint(0, 999_999)
         llm.reset()
 
-        # Sample opponents
-        n_opponents = min(num_players - 1, len(ARCHETYPES))
-        opp_specs = random.sample(ARCHETYPES, n_opponents)
+        # Sample opponents from the chosen pool (without replacement per game)
+        n_opponents = num_players - 1  # already validated above
+        opp_specs = random.sample(archetype_pool, n_opponents)
         opponents = [cls(player_id=i + 1, name=f"{nm}") for i, (nm, cls) in enumerate(opp_specs)]
 
         # Randomise LLM seat
@@ -260,7 +303,7 @@ def run_tournament(
 
         llm_id = llm_seat
 
-        ep = run_episode(agents_list, seed=seed, verbose=verbose)
+        ep = run_episode(agents_list, seed=seed, verbose=verbose, max_turns=max_turns)
         log = ep.to_dict()
         winner_id = log["outcome"]["winner"]
 
@@ -325,9 +368,29 @@ def run_tournament(
             wins = sum(1 for s in all_game_summaries if s["llm_won"])
             wr = wins / (game_num + 1) * 100
             logger.info("Game %s/%s | %s win rate: %.1f%%", game_num + 1, num_games, llm_results_key, wr)
+            # Save partial results every 10 games so a crash loses at most 10 games
+            _safe_slug = llm_results_key.replace("/", "-").replace(" ", "_")
+            checkpoint_file = output_dir / f"phase1_checkpoint_{_safe_slug}.json"
+            with open(checkpoint_file, "w") as f:
+                json.dump({
+                    "config": {
+                        "num_games": num_games, "num_players": num_players,
+                        "llm_provider": llm_provider, "llm_model": llm_model,
+                        "llm_results_key": llm_results_key, "prompt_mode": prompt_mode,
+                        "opponent_pool": opponent_pool,
+                        "opponent_pool_agents": [nm for nm, _ in archetype_pool],
+                    },
+                    "games_completed": game_num + 1,
+                    "agent_stats": {k: dict(v) for k, v in agent_stats.items()},
+                    "game_summaries": all_game_summaries,
+                }, f, indent=2)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_slug = llm_results_key.replace("/", "-").replace(" ", "_")
+    # Remove checkpoint file now that the full run is saved
+    checkpoint_file = output_dir / f"phase1_checkpoint_{safe_slug}.json"
+    if checkpoint_file.exists():
+        checkpoint_file.unlink()
 
     # Save traces
     if save_traces and llm.reasoning_traces:
@@ -344,6 +407,8 @@ def run_tournament(
             "llm_model":       llm_model,
             "llm_results_key": llm_results_key,
             "prompt_mode":     prompt_mode,
+            "opponent_pool":   opponent_pool,
+            "opponent_pool_agents": [nm for nm, _ in archetype_pool],
         },
         "agent_stats":    {k: dict(v) for k, v in agent_stats.items()},
         "game_summaries": all_game_summaries,
@@ -353,11 +418,11 @@ def run_tournament(
     with open(results_file, "w") as f:
         json.dump(final_results, f, indent=2)
 
-    _print_summary(all_game_summaries, llm_results_key, num_games)
+    _print_summary(all_game_summaries, llm_results_key, num_games, opponent_pool)
     return final_results
 
 
-def _print_summary(summaries: list, llm_key: str, num_games: int) -> None:
+def _print_summary(summaries: list, llm_key: str, num_games: int, opponent_pool: str = "full") -> None:
     wins    = sum(1 for s in summaries if s["llm_won"])
     bluffs  = sum(s["llm_bluffs_attempted"] for s in summaries)
     caught  = sum(s["llm_bluffs_caught"] for s in summaries)
@@ -366,8 +431,18 @@ def _print_summary(summaries: list, llm_key: str, num_games: int) -> None:
     mis     = [s["mutual_information"] for s in summaries]
     kls     = [s["kl_divergence"] for s in summaries]
 
+    # Opponent win rates from summaries
+    opp_wins: dict = defaultdict(lambda: {"wins": 0, "games": 0})
+    for s in summaries:
+        for opp in s["opponents"]:
+            opp_wins[opp]["games"] += 1
+        winner = s["winner"]
+        if not s["llm_won"] and winner in opp_wins:
+            opp_wins[winner]["wins"] += 1
+
     print(f"\n{'='*65}")
     print(f"PHASE 1 RESULTS — {llm_key}")
+    print(f"  Opponent pool:    {opponent_pool}")
     print(f"{'='*65}")
     print(f"  Games:            {num_games}")
     print(f"  Win rate:         {wins}/{num_games} ({wins/num_games*100:.1f}%)")
@@ -375,6 +450,11 @@ def _print_summary(summaries: list, llm_key: str, num_games: int) -> None:
     print(f"  Challenge acc:    {chal_w}/{chals} ({chal_w/max(chals,1)*100:.1f}%)")
     print(f"  Avg MI:           {sum(mis)/max(len(mis),1):.3f}")
     print(f"  Avg KL:           {sum(kls)/max(len(kls),1):.3f}")
+    print(f"{'='*65}")
+    print(f"  Opponent win rates this run:")
+    for oname, s in sorted(opp_wins.items(), key=lambda x: -x[1]["wins"]/max(x[1]["games"],1)):
+        wr = s["wins"] / s["games"] * 100 if s["games"] else 0
+        print(f"    {oname:<22} {s['wins']:>2}/{s['games']:>2} ({wr:.1f}%)")
     print(f"{'='*65}\n")
 
 
@@ -397,6 +477,16 @@ def main():
     parser.add_argument("--api-key",  type=str, default=None)
     parser.add_argument("--prompt-mode", type=str, default="cot",
                         choices=list(PROMPT_MODES))
+    parser.add_argument("--max-turns", type=int, default=MAX_TURNS,
+                        help="Turn cap per game (default 300; lower = faster/cheaper)")
+    parser.add_argument("--opponent-pool", type=str, default="full",
+                        choices=list(OPPONENT_POOLS),
+                        help=(
+                            "Which opponent pool to sample from. "
+                            "'full' (default) uses all 6 archetypes including TheSaint and GameTheorist. "
+                            "'controlled' excludes the two dominant agents (TheSaint WR=48%%, "
+                            "GameTheorist WR=45%%) for a fair-field comparison."
+                        ))
     args = parser.parse_args()
 
     env_path = Path(__file__).parent.parent / ".env"
@@ -428,6 +518,8 @@ def main():
             base_url=args.base_url,
             api_key=args.api_key,
             prompt_mode=args.prompt_mode,
+            max_turns=args.max_turns,
+            opponent_pool=args.opponent_pool,
         )
 
 

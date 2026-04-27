@@ -300,6 +300,48 @@ class TheAccountant(BaseAgent):
 
 
 # ---------------------------------------------------------------------------
+# Balanced Player — calibrated symmetric baseline for controlled experiments
+# ---------------------------------------------------------------------------
+
+class BalancedPlayer(BaseAgent):
+    """
+    Calibrated symmetric baseline for controlled/symmetric opponent pools.
+
+    Design goals:
+      1. Symmetric: 3 clones in a 4-player game each win ~25% by construction.
+         Any LLM deviation from 25% is a clean skill signal with no confound.
+      2. Non-trivial: flat 25% challenge rate means bluffs are caught ~58% of
+         the time (matches observed 61–71% in real runs), so bluffing carries
+         genuine risk.
+      3. Stateless: no history tracking, no adaptive behaviour.  Every clone
+         is strictly identical turn-by-turn — symmetry cannot break.
+
+    Play  : honest 1 card when possible; 1 forced bluff card when not.
+    Challenge: flat CHALLENGE_RATE probability, no conditioning on game state.
+    """
+
+    CHALLENGE_RATE: float = 0.25
+
+    def reset(self) -> None:
+        pass
+
+    def choose_action(self, obs: Dict[str, Any]) -> Dict[str, Any]:
+        rank = obs["current_rank"]
+        hand: List[Card] = obs["my_hand"]
+
+        # Challenge decision: fixed probability, no adaptive tracking
+        if _is_opponents_claim(obs, self.player_id):
+            if random.random() < self.CHALLENGE_RATE:
+                return {"type": "challenge"}
+
+        # Play decision: one honest card if available, else one bluff card
+        real, _ = _partition(hand, rank)
+        if real:
+            return {"type": "play", "cards": [real[0]], "claimed_rank": rank}
+        return {"type": "play", "cards": [hand[0]], "claimed_rank": rank}
+
+
+# ---------------------------------------------------------------------------
 # The Collector — builds four-of-a-kinds; challenges to complete sets
 # ---------------------------------------------------------------------------
 

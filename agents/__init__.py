@@ -7,6 +7,7 @@ from .archetypes import (
     MrPathological,
     TheAccountant,
     TheCollector,
+    BalancedPlayer,
 )
 from .llm_agent import LLMAgent, MODEL_CONFIGS, PROMPT_MODES, parse_model_spec
 
@@ -21,6 +22,7 @@ __all__ = [
     "MrPathological",
     "TheAccountant",
     "TheCollector",
+    "BalancedPlayer",
     "LLMAgent",
     "MODEL_CONFIGS",
     "PROMPT_MODES",
