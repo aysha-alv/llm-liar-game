@@ -334,10 +334,14 @@ class BalancedPlayer(BaseAgent):
             if random.random() < self.CHALLENGE_RATE:
                 return {"type": "challenge"}
 
-        # Play decision: one honest card if available, else one bluff card
+        # Play decision: all honest cards (up to 4) if available, else one bluff card.
+        # Playing real[:4] matches every other archetype and ensures hand depletion
+        # rate is comparable to the LLM (which also plays 1-4 cards per turn).
+        # Playing only 1 card here causes BalancedPlayer to deplete its hand ~4x
+        # slower than the LLM, producing a trivial 100% LLM win rate.
         real, _ = _partition(hand, rank)
         if real:
-            return {"type": "play", "cards": [real[0]], "claimed_rank": rank}
+            return {"type": "play", "cards": real[:4], "claimed_rank": rank}
         return {"type": "play", "cards": [hand[0]], "claimed_rank": rank}
 
 

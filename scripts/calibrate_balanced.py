@@ -43,6 +43,7 @@ def run_calibration_episode(seed: int) -> int:
     rng.shuffle(deck)
     hands = deal(deck, n)
     state = GameState.new(hands)
+    state.current_player = rng.randint(0, n - 1)
 
     agents = [BalancedPlayer(player_id=i, name=f"BP{i}") for i in range(n)]
     for agent in agents:

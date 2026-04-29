@@ -98,6 +98,9 @@ def run_episode(agents, seed: int, verbose: bool = False, max_turns: int = MAX_T
     rng.shuffle(deck)
     hands = deal(deck, n)
     state = GameState.new(hands)
+    # Randomise starting player using the seeded RNG so results are reproducible
+    # per seed but no seat has a systematic first-mover advantage.
+    state.current_player = rng.randint(0, n - 1)
 
     for agent in agents:
         agent.reset()
