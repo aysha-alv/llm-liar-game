@@ -309,36 +309,49 @@ class BalancedPlayer(BaseAgent):
 
     Design goals:
       1. Symmetric: 3 clones in a 4-player game each win ~25% by construction.
-         Any LLM deviation from 25% is a clean skill signal with no confound.
-      2. Non-trivial: flat 25% challenge rate means bluffs are caught ~58% of
-         the time (matches observed 61–71% in real runs), so bluffing carries
-         genuine risk.
-      3. Stateless: no history tracking, no adaptive behaviour.  Every clone
-         is strictly identical turn-by-turn — symmetry cannot break.
+         Any LLM deviation from 25% is a clean skill signal.
+      2. Games terminate naturally: random challenge rates cause wrong challenges
+         that redistribute large piles back into hands, so hands never empty and
+         games hit the turn cap. Accurate (impossibility-based) challenges avoid
+         this — wrong challenges are essentially zero, so hands deplete at full
+         rate and games end in ~60-100 turns.
+      3. Symmetric state tracking: all clones observe the same public events and
+         run the same algorithm, so symmetry holds even with state.
 
-    Play  : honest 1 card when possible; 1 forced bluff card when not.
-    Challenge: flat CHALLENGE_RATE probability, no conditioning on game state.
+    Play     : all honest cards (up to 4) when available; 1 forced bluff otherwise.
+    Challenge: only when total claimed for this rank this cycle exceeds 8
+               (mathematically impossible with 2 decks of 4 suits each).
+               Mirrors TheSaint's challenge logic exactly.
     """
 
-    CHALLENGE_RATE: float = 0.25
+    MAX_HONEST_PER_RANK: int = 8  # 2 decks × 4 suits
+
+    def __init__(self, player_id: int, name: str = "BalancedPlayer"):
+        super().__init__(player_id, name)
+        self._rank_claimed: Dict[str, int] = defaultdict(int)
 
     def reset(self) -> None:
-        pass
+        self._rank_claimed = defaultdict(int)
+
+    def observe_event(self, event: Dict[str, Any]) -> None:
+        if "claimed_rank" in event:
+            self._rank_claimed[event["claimed_rank"]] += event.get("n_cards", 0)
+        if event.get("action", {}).get("type") == "challenge":
+            self._rank_claimed = defaultdict(int)
 
     def choose_action(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         rank = obs["current_rank"]
         hand: List[Card] = obs["my_hand"]
 
-        # Challenge decision: fixed probability, no adaptive tracking
+        # Challenge only when the total cards claimed for this rank this cycle
+        # exceeds what's physically possible (>8 with 2 decks).
         if _is_opponents_claim(obs, self.player_id):
-            if random.random() < self.CHALLENGE_RATE:
+            lc = obs["last_claim"]
+            total_claimed = self._rank_claimed.get(rank, 0) + lc["n_cards"]
+            if total_claimed > self.MAX_HONEST_PER_RANK:
                 return {"type": "challenge"}
 
-        # Play decision: all honest cards (up to 4) if available, else one bluff card.
-        # Playing real[:4] matches every other archetype and ensures hand depletion
-        # rate is comparable to the LLM (which also plays 1-4 cards per turn).
-        # Playing only 1 card here causes BalancedPlayer to deplete its hand ~4x
-        # slower than the LLM, producing a trivial 100% LLM win rate.
+        # Play: honest cards first (up to 4), forced bluff when none available.
         real, _ = _partition(hand, rank)
         if real:
             return {"type": "play", "cards": real[:4], "claimed_rank": rank}

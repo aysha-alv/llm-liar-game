@@ -142,7 +142,7 @@ def main():
 
     n_seats = 4
     print(f"\n{'='*55}")
-    print(f"CALIBRATION RESULTS — BalancedPlayer (CHALLENGE_RATE={BalancedPlayer.CHALLENGE_RATE})")
+    print(f"CALIBRATION RESULTS — BalancedPlayer (challenge=impossibility, play=honest[:4])")
     print(f"{'='*55}")
     print(f"  Total games: {args.games}")
     print(f"  Expected WR per seat: 25.0%")
