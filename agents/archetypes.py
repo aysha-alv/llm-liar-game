@@ -352,6 +352,8 @@ class BalancedPlayer(BaseAgent):
                 return {"type": "challenge"}
 
         # Play: honest cards first (up to 4), forced bluff when none available.
+        # Cap of 4 matches the engine's maximum play size and ensures BP's
+        # throughput matches the LLM's (which can also play up to 4 cards).
         real, _ = _partition(hand, rank)
         if real:
             return {"type": "play", "cards": real[:4], "claimed_rank": rank}

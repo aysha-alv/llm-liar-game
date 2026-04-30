@@ -449,7 +449,18 @@ class LLMAgent(BaseAgent):
 
     def choose_action(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         lc = obs.get("last_claim")
-        is_challenge_decision = (lc is not None and lc["player_id"] != self.player_id)
+        # It's a challenge decision only when:
+        #   1. There IS a pending claim from another player, AND
+        #   2. It is NOT our turn to play (current_player != self.player_id)
+        # Without condition 2, the LLM would treat its own play turn as a
+        # challenge turn (because last_claim persists from the previous turn),
+        # always fall back to 1-card plays, and never reach the play prompt.
+        is_active_player = (obs.get("current_player") == self.player_id)
+        is_challenge_decision = (
+            lc is not None
+            and lc["player_id"] != self.player_id
+            and not is_active_player
+        )
 
         if is_challenge_decision:
             prompt = self._build_challenge_prompt(obs)
