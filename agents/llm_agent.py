@@ -88,6 +88,7 @@ RULES for the play action:
 - "cards" must list ONLY cards currently in your hand (exact RankSuit strings).
 - "claimed_count" must EQUAL the number of cards in "cards" (1–4).
 - You may play cards of ANY rank, but you are CLAIMING they match the required rank.
+- SPEED TIP: When you have matching cards, play ALL of them (up to 4). More cards per turn = faster hand depletion = closer to winning.
 
 When you are DECIDING WHETHER TO CHALLENGE another player's play:
 {
@@ -130,7 +131,7 @@ ONLY use cards that appear in "My hand" below. Do NOT invent cards.
 
 ═══ STRATEGY GUIDELINES ═══
 
-• PLAY HONESTLY when you have matching cards — it is risk-free progress toward emptying your hand.
+• PLAY HONESTLY when you have matching cards — play ALL of them (up to 4). More cards per turn = faster depletion = closer to winning.
 • When you MUST bluff, play as FEW cards as possible (1 is safest). Pick cards from ranks you have many of (expendable).
 • CHALLENGE only when you are HIGHLY confident AND the discard pile is small enough that losing the challenge is survivable.
   Winning a challenge does NOT reduce YOUR hand. Losing means YOU pick up the entire pile.
@@ -196,7 +197,7 @@ ONLY use cards that appear in "My hand" below. Do NOT invent cards.
 
 ═══ STRATEGY GUIDELINES ═══
 
-• PLAY HONESTLY when you have matching cards — it is risk-free progress toward emptying your hand.
+• PLAY HONESTLY when you have matching cards — play ALL of them (up to 4). More cards per turn = faster depletion = closer to winning.
 • When you MUST bluff, play as FEW cards as possible (1 is safest). Pick cards from ranks you have many of (expendable).
 • CHALLENGE only when you are HIGHLY confident AND the discard pile is small enough that losing the challenge is survivable.
   Winning a challenge does NOT reduce YOUR hand. Losing means YOU pick up the entire pile.
@@ -205,9 +206,9 @@ ONLY use cards that appear in "My hand" below. Do NOT invent cards.
 
 ═══ EXAMPLES ═══
 
-Example 1 — Honest play (have matching cards):
-Rank=K. My hand has K♠, K♥, 3♦. → Play both Kings honestly.
-{"action": "play", "cards": ["K♠","K♥"], "claimed_count": 2, "reasoning": "Have 2 Ks — play honestly, risk-free."}
+Example 1 — Honest play (have matching cards, play ALL of them):
+Rank=K. My hand has K♠, K♥, 3♦. → Play BOTH Kings (all matching cards, up to 4).
+{"action": "play", "cards": ["K♠","K♥"], "claimed_count": 2, "reasoning": "Have 2 Ks — play all of them honestly. More cards = faster depletion."}
 
 Example 2 — Minimal bluff (no matching cards):
 Rank=7. My hand has no 7s. 18 cards in hand. → Bluff 1 expendable card.
